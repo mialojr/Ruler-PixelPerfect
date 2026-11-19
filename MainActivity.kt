@@ -613,10 +613,10 @@ imageReader = null
 mediaProjection?.stop()
 mediaProjection = null
 if (viewsAdded) {
-try { wm.removeViewImmediate(canvasView) } catch (: Exception) {}
-try { wm.removeViewImmediate(panelLayout) } catch (: Exception) {}
-try { wm.removeViewImmediate(coordsBox) } catch (: Exception) {}
-try { wm.removeViewImmediate(loupeView) } catch (: Exception) {}
+try { wm.removeViewImmediate(canvasView) } catch (e: Exception) {}
+try { wm.removeViewImmediate(panelLayout) } catch (e: Exception) {}
+try { wm.removeViewImmediate(coordsBox) } catch (e: Exception) {}
+try { wm.removeViewImmediate(loupeView) } catch (e: Exception) {}
 viewsAdded = false
 }
 stopForeground(STOP_FOREGROUND_REMOVE)
