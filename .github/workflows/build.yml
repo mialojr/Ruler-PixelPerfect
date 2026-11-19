@@ -1,0 +1,123 @@
+
+---
+
+### Fichier 2 : Le script automatique (`.github/workflows/build.yml`)
+1. Retournez à l'accueil de votre dépôt GitHub et cliquez de nouveau sur **Add file** > **Create new file**.
+2. Dans la case du nom du fichier, tapez exactement : `.github/workflows/build.yml` (les `/` vont créer les dossiers automatiquement).
+3. Collez le script ci-dessous et cliquez sur **Commit changes** :
+
+```yaml
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/pixel/ruler
+          cp MainActivity.kt app/src/main/java/com/pixel/ruler/MainActivity.kt
+
+          cat << 'EOF' > settings.gradle
+          rootProject.name = "PixelRuler"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          buildscript {
+              ext.kotlin_version = '1.9.22'
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.2.2'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          apply plugin: 'com.android.application'
+          apply plugin: 'kotlin-android'
+
+          android {
+              namespace 'com.pixel.ruler'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.pixel.ruler"
+                  minSdk 23
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.22"
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <application
+                  android:label="PixelRuler"
+                  android:theme="@android:style/Theme.Translucent.NoTitleBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+
+      - name: Build APK with Gradle
+        run: |
+          gradle wrapper --gradle-version 8.5
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelRuler-APK
+          path: app/build/outputs/apk/
