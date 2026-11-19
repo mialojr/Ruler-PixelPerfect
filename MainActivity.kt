@@ -3,6 +3,7 @@ package com.pixel.ruler
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -37,11 +38,7 @@ class MainActivity : Activity() {
         val serviceIntent = Intent(this, OverlayService::class.java).apply {
             action = "ACTION_START_OR_SHOW"
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
-        }
+        startService(serviceIntent)
         finish()
     }
 
@@ -120,7 +117,6 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundNotification()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
         val metrics = DisplayMetrics()
@@ -134,7 +130,6 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundNotification()
         if (!viewsAdded) {
             initAllViews()
         }
@@ -148,11 +143,16 @@ class OverlayService : Service() {
                 intent.getParcelableExtra("DATA")
             }
             if (code == Activity.RESULT_OK && data != null) {
-                setupMediaProjection(code, data)
-                isLoupeActive = true
-                loupeView.visibility = View.VISIBLE
-                loupeBtnRef?.setBackgroundColor(Color.parseColor("#AA0088CC"))
-                mainHandler.postDelayed({ updateLoupe() }, 250)
+                try {
+                    promoteToForegroundMediaProjection()
+                    setupMediaProjection(code, data)
+                    isLoupeActive = true
+                    loupeView.visibility = View.VISIBLE
+                    loupeBtnRef?.setBackgroundColor(Color.parseColor("#AA0088CC"))
+                    mainHandler.postDelayed({ updateLoupe() }, 250)
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Erreur loupe : ${e.message}", Toast.LENGTH_SHORT).show()
+                }
             }
         }
         return START_NOT_STICKY
@@ -168,27 +168,32 @@ class OverlayService : Service() {
         viewsAdded = true
     }
 
-    private fun startForegroundNotification() {
+    private fun promoteToForegroundMediaProjection() {
         val channelId = "pixel_ruler_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "PixelRuler Overlay", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(channelId, "PixelRuler Loupe", NotificationManager.IMPORTANCE_LOW)
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
         val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("PixelRuler actif")
-                .setContentText("Règle de précision en cours")
+                .setContentTitle("PixelRuler Loupe x20")
+                .setContentText("Capture loupe active")
                 .setSmallIcon(android.R.drawable.ic_menu_crop)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("PixelRuler actif")
+                .setContentTitle("PixelRuler Loupe x20")
                 .setSmallIcon(android.R.drawable.ic_menu_crop)
                 .build()
         }
-        startForeground(1, notif)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, notif)
+        }
     }
 
     private fun setupMediaProjection(code: Int, data: Intent) {
@@ -199,7 +204,6 @@ class OverlayService : Service() {
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpm.getMediaProjection(code, data)
 
-        // Obligatoire sur Android 14+ avant createVirtualDisplay
         mediaProjection?.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 mainHandler.post {
@@ -252,11 +256,11 @@ class OverlayService : Service() {
         updateCoordsDisplay()
     }
 
-    private fun setupCanvas() {
-        canvasView = RulerCanvasView(this) {
-            updateCoordsDisplay()
-            if (isLoupeActive) updateLoupe()
-        }
+private fun setupCanvas() {
+canvasView = RulerCanvasView(this) {
+updateCoordsDisplay()
+if (isLoupeActive) updateLoupe()
+}
 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 canvasParams = WindowManager.LayoutParams(
@@ -606,12 +610,14 @@ dialog.window?.setType(type)
 dialog.show()
 }
 private fun cleanupAndStop() {
+try {
 virtualDisplay?.release()
 virtualDisplay = null
 imageReader?.close()
 imageReader = null
 mediaProjection?.stop()
 mediaProjection = null
+} catch (e: Exception) {}
 if (viewsAdded) {
 try { wm.removeViewImmediate(canvasView) } catch (e: Exception) {}
 try { wm.removeViewImmediate(panelLayout) } catch (e: Exception) {}
@@ -619,7 +625,7 @@ try { wm.removeViewImmediate(coordsBox) } catch (e: Exception) {}
 try { wm.removeViewImmediate(loupeView) } catch (e: Exception) {}
 viewsAdded = false
 }
-stopForeground(STOP_FOREGROUND_REMOVE)
+try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) {}
 stopSelf()
 }
 override fun onDestroy() {
