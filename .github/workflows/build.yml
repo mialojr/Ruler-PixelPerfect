@@ -19,9 +19,6 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Generate Android Project Structure
         run: |
           mkdir -p app/src/main/java/com/pixel/ruler
@@ -81,10 +78,13 @@ jobs:
           }
           EOF
 
-          cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
+          NS="http://schemas.android"
+          NS="${NS}.com/apk/res/android"
+          cat << EOF > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="${NS}">
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
               <application
                   android:label="PixelRuler"
                   android:theme="@android:style/Theme.Translucent.NoTitleBar">
@@ -98,6 +98,7 @@ jobs:
                   </activity>
                   <service
                       android:name=".OverlayService"
+                      android:foregroundServiceType="mediaProjection"
                       android:exported="false"/>
               </application>
           </manifest>
