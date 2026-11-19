@@ -67,6 +67,7 @@ data class RulerLine(val isHorizontal: Boolean, var pos: Float, var color: Int)
 class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private lateinit var canvasView: RulerCanvasView
+    private lateinit var canvasParams: WindowManager.LayoutParams
     private lateinit var panelLayout: LinearLayout
     private lateinit var panelParams: WindowManager.LayoutParams
     private lateinit var coordsBox: LinearLayout
@@ -77,6 +78,7 @@ class OverlayService : Service() {
     private var isPanelRight = true
     private var areCoordsFloating = false
     private var isLoupeActive = false
+    private var isTouchEnabled = true
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -192,14 +194,33 @@ class OverlayService : Service() {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 
-        val params = WindowManager.LayoutParams(
+        canvasParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
-        wm.addView(canvasView, params)
+        wm.addView(canvasView, canvasParams)
+    }
+
+    private fun toggleTouchPassThrough(btn: Button) {
+        isTouchEnabled = !isTouchEnabled
+        if (isTouchEnabled) {
+            canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            btn.text = "Tactile: ON"
+            btn.setBackgroundColor(Color.parseColor("#AA009944"))
+        } else {
+            canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            btn.text = "Tactile: OFF"
+            btn.setBackgroundColor(Color.parseColor("#AA666666"))
+        }
+        wm.updateViewLayout(canvasView, canvasParams)
+        canvasView.showArrows = isTouchEnabled
+        canvasView.invalidate()
     }
 
     private fun setupLoupe() {
@@ -223,33 +244,31 @@ class OverlayService : Service() {
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
                         initX = loupeParams.x; initY = loupeParams.y
-                        touchX = event.rawX; touchY = event.rawY
-                        return true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        loupeParams.x = initX + (event.rawX - touchX).toInt()
-                        loupeParams.y = initY + (event.rawY - touchY).toInt()
-                        wm.updateViewLayout(loupeView, loupeParams)
-                        return true
-                    }
-                }
-                return false
-            }
-        })
-
-        loupeView.visibility = View.GONE
-        wm.addView(loupeView, loupeParams)
-    }
-
-    private fun updateLoupe() {
-        if (!isLoupeActive) return
-        val allLines = canvasView.getAllLines()
-        var vPos = screenW / 2f
-        var hPos = screenH / 2f
-        for (line in allLines) {
-            if (line.isHorizontal) hPos = line.pos else vPos = line.pos
-        }
-        val sel = canvasView.selectedLine
+touchX = event.rawX; touchY = event.rawY
+return true
+}
+MotionEvent.ACTION_MOVE -> {
+loupeParams.x = initX + (event.rawX - touchX).toInt()
+loupeParams.y = initY + (event.rawY - touchY).toInt()
+wm.updateViewLayout(loupeView, loupeParams)
+return true
+}
+}
+return false
+}
+})
+loupeView.visibility = View.GONE
+wm.addView(loupeView, loupeParams)
+}
+private fun updateLoupe() {
+if (!isLoupeActive) return
+val allLines = canvasView.getAllLines()
+var vPos = screenW / 2f
+var hPos = screenH / 2f
+for (line in allLines) {
+if (line.isHorizontal) hPos = line.pos else vPos = line.pos
+}
+val sel = canvasView.selectedLine
 val targetX = if (sel != null && !sel.isHorizontal) sel.pos else vPos
 val targetY = if (sel != null && sel.isHorizontal) sel.pos else hPos
 val bmp = captureScreenFrame()
@@ -258,12 +277,14 @@ loupeView.updateData(bmp, targetX, targetY, allLines)
 private fun setupSidePanel() {
 panelLayout = LinearLayout(this).apply {
 orientation = LinearLayout.VERTICAL
-setBackgroundColor(Color.parseColor("#CC1A1A1A"))
-setPadding(12, 16, 12, 16)
+setBackgroundColor(Color.parseColor("#DD1A1A1A"))
+setPadding(14, 18, 14, 18)
 }
 lateinit var loupeBtn: Button
+lateinit var touchBtn: Button
 val buttons = listOf(
 "Off" to { stopSelf() },
+"Tactile: ON" to { toggleTouchPassThrough(touchBtn) },
 "+ H" to {
 val c = prefs.getInt("color_h", Color.RED)
 val y = prefs.getInt("default_y", 400).toFloat() + (canvasView.lineCount() * 30)
@@ -307,14 +328,25 @@ if (!areCoordsFloating) dockCoordsBox()
 buttons.forEach { (label, action) ->
 val btn = Button(this).apply {
 text = label
-textSize = 11f
+textSize = 12f
+isAllCaps = false
+setTypeface(null, Typeface.BOLD)
 setTextColor(Color.WHITE)
-setBackgroundColor(if (label == "Off") Color.parseColor("#99CC0000") else Color.parseColor("#44FFFFFF"))
-val lp = LinearLayout.LayoutParams(170, 88).apply { setMargins(0, 5, 0, 5) }
+setPadding(10, 0, 10, 0)
+gravity = Gravity.CENTER
+setBackgroundColor(
+when (label) {
+"Off" -> Color.parseColor("#BBCC0000")
+"Tactile: ON" -> Color.parseColor("#AA009944")
+else -> Color.parseColor("#44FFFFFF")
+}
+)
+val lp = LinearLayout.LayoutParams(250, 96).apply { setMargins(0, 6, 0, 6) }
 layoutParams = lp
 setOnClickListener { action() }
 }
 if (label == "Loupe") loupeBtn = btn
+if (label == "Tactile: ON") touchBtn = btn
 panelLayout.addView(btn)
 }
 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -334,7 +366,7 @@ private fun setupCoordsBox() {
 coordsBox = LinearLayout(this).apply {
 orientation = LinearLayout.VERTICAL
 setBackgroundColor(Color.parseColor("#DD000000"))
-setPadding(16, 12, 16, 12)
+setPadding(18, 14, 18, 14)
 }
 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
@@ -373,7 +405,7 @@ wm.addView(coordsBox, coordsParams)
 }
 private fun dockCoordsBox() {
 areCoordsFloating = false
-coordsParams.x = if (isPanelRight) 20 else 220
+coordsParams.x = if (isPanelRight) 20 else 300
 coordsParams.y = 100
 wm.updateViewLayout(coordsBox, coordsParams)
 }
@@ -381,7 +413,7 @@ private fun updateCoordsDisplay() {
 coordsBox.removeAllViews()
 val header = TextView(this).apply {
 text = if (areCoordsFloating) "📌 Coords (Ranger)" else "📐 Coords (Glisser)"
-textSize = 11f
+textSize = 12f
 setTextColor(Color.LTGRAY)
 setOnClickListener { dockCoordsBox() }
 }
@@ -392,7 +424,7 @@ val vLines = allLines.filter { !it.isHorizontal }
 if (hLines.isEmpty() || vLines.isEmpty()) {
 val info = TextView(this).apply {
 text = "Ajoutez 1 H et 1 V"
-textSize = 11f
+textSize = 12f
 setTextColor(Color.GRAY)
 }
 coordsBox.addView(info)
@@ -403,13 +435,13 @@ for (h in hLines) {
 val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 val tvX = TextView(this).apply {
 text = "X:${v.pos.toInt()} "
-textSize = 13f
+textSize = 14f
 setTypeface(null, Typeface.BOLD)
 setTextColor(v.color)
 }
 val tvY = TextView(this).apply {
 text = "Y:${h.pos.toInt()}"
-textSize = 13f
+textSize = 14f
 setTypeface(null, Typeface.BOLD)
 setTextColor(h.color)
 }
@@ -578,6 +610,7 @@ canvas.drawRect(2f, 2f, w - 2f, h - 2f, borderPaint)
 class RulerCanvasView(context: Context, val onUpdate: () -> Unit) : View(context) {
 private val lines = ArrayList()
 var selectedLine: RulerLine? = null
+var showArrows = true
 private var isDragging = false
 fun addLine(line: RulerLine) { lines.add(line) }
 fun lineCount(): Int = lines.size
@@ -615,6 +648,7 @@ canvas.drawLine(0f, line.pos, width.toFloat(), line.pos, linePaint)
 canvas.drawLine(line.pos, 0f, line.pos, height.toFloat(), linePaint)
 }
 }
+if (!showArrows) return
 selectedLine?.let { line ->
 if (line.isHorizontal) {
 val cx = width / 2f
