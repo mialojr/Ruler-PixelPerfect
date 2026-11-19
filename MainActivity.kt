@@ -159,10 +159,10 @@ class OverlayService : Service() {
 
     private fun captureScreenFrame(): Bitmap? {
         val image = imageReader?.acquireLatestImage() ?: return screenBitmap
-        val planes = image.planes
-        val buffer = planes.buffer
-        val pixelStride = planes.pixelStride
-        val rowStride = planes.rowStride
+        val plane = image.planes.first()
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
         val rowPadding = rowStride - pixelStride * screenW
         val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
         bmp.copyPixelsFromBuffer(buffer)
@@ -177,9 +177,9 @@ class OverlayService : Service() {
         val colorH = prefs.getInt("color_h", Color.RED)
         val colorV = prefs.getInt("color_v", Color.CYAN)
 
-        canvasView.lines.add(RulerLine(true, defY, colorH))
-        canvasView.lines.add(RulerLine(false, defX, colorV))
-        canvasView.selectedLine = canvasView.lines.first()
+        canvasView.addLine(RulerLine(true, defY, colorH))
+        canvasView.addLine(RulerLine(false, defX, colorV))
+        canvasView.selectedLine = canvasView.getAllLines().firstOrNull()
         canvasView.invalidate()
         updateCoordsDisplay()
     }
@@ -243,14 +243,17 @@ class OverlayService : Service() {
 
     private fun updateLoupe() {
         if (!isLoupeActive) return
-        val vLine = canvasView.lines.firstOrNull { !it.isHorizontal }
-        val hLine = canvasView.lines.firstOrNull { it.isHorizontal }
+        val allLines = canvasView.getAllLines()
+        var vPos = screenW / 2f
+        var hPos = screenH / 2f
+        for (line in allLines) {
+            if (line.isHorizontal) hPos = line.pos else vPos = line.pos
+        }
         val sel = canvasView.selectedLine
-
-        val targetX = if (sel != null && !sel.isHorizontal) sel.pos else (vLine?.pos ?: (screenW / 2f))
-val targetY = if (sel != null && sel.isHorizontal) sel.pos else (hLine?.pos ?: (screenH / 2f))
+val targetX = if (sel != null && !sel.isHorizontal) sel.pos else vPos
+val targetY = if (sel != null && sel.isHorizontal) sel.pos else hPos
 val bmp = captureScreenFrame()
-loupeView.updateData(bmp, targetX, targetY, canvasView.lines)
+loupeView.updateData(bmp, targetX, targetY, allLines)
 }
 private fun setupSidePanel() {
 panelLayout = LinearLayout(this).apply {
@@ -263,29 +266,26 @@ val buttons = listOf(
 "Off" to { stopSelf() },
 "+ H" to {
 val c = prefs.getInt("color_h", Color.RED)
-val y = prefs.getInt("default_y", 400).toFloat() + (canvasView.lines.size * 30)
-canvasView.lines.add(RulerLine(true, y, c))
-canvasView.selectedLine = canvasView.lines.last()
+val y = prefs.getInt("default_y", 400).toFloat() + (canvasView.lineCount() * 30)
+val newLine = RulerLine(true, y, c)
+canvasView.addLine(newLine)
+canvasView.selectedLine = newLine
 canvasView.invalidate()
 updateCoordsDisplay()
 if (isLoupeActive) updateLoupe()
 },
 "+ V" to {
 val c = prefs.getInt("color_v", Color.CYAN)
-val x = prefs.getInt("default_x", 300).toFloat() + (canvasView.lines.size * 30)
-canvasView.lines.add(RulerLine(false, x, c))
-canvasView.selectedLine = canvasView.lines.last()
+val x = prefs.getInt("default_x", 300).toFloat() + (canvasView.lineCount() * 30)
+val newLine = RulerLine(false, x, c)
+canvasView.addLine(newLine)
+canvasView.selectedLine = newLine
 canvasView.invalidate()
 updateCoordsDisplay()
 if (isLoupeActive) updateLoupe()
 },
 "-" to {
-if (canvasView.selectedLine != null) {
-canvasView.lines.remove(canvasView.selectedLine)
-canvasView.selectedLine = canvasView.lines.lastOrNull()
-} else if (canvasView.lines.isNotEmpty()) {
-canvasView.lines.removeAt(canvasView.lines.lastIndex)
-}
+canvasView.removeSelectedOrLast()
 canvasView.invalidate()
 updateCoordsDisplay()
 if (isLoupeActive) updateLoupe()
@@ -386,8 +386,9 @@ setTextColor(Color.LTGRAY)
 setOnClickListener { dockCoordsBox() }
 }
 coordsBox.addView(header)
-val hLines = canvasView.lines.filter { it.isHorizontal }
-val vLines = canvasView.lines.filter { !it.isHorizontal }
+val allLines = canvasView.getAllLines()
+val hLines = allLines.filter { it.isHorizontal }
+val vLines = allLines.filter { !it.isHorizontal }
 if (hLines.isEmpty() || vLines.isEmpty()) {
 val info = TextView(this).apply {
 text = "Ajoutez 1 H et 1 V"
@@ -516,7 +517,7 @@ class LoupeView(context: Context) : View(context) {
 private var sourceBitmap: Bitmap? = null
 private var focusX = 0f
 private var focusY = 0f
-private var lines: List = emptyList()
+private var lines: Array = emptyArray()
 private val zoomFactor = 20f
 private val borderPaint = Paint().apply {
 color = Color.WHITE
@@ -535,7 +536,7 @@ textSize = 22f
 textAlign = Paint.Align.CENTER
 isFakeBoldText = true
 }
-fun updateData(bmp: Bitmap?, fx: Float, fy: Float, allLines: List) {
+fun updateData(bmp: Bitmap?, fx: Float, fy: Float, allLines: Array) {
 sourceBitmap = bmp
 focusX = fx
 focusY = fy
@@ -557,7 +558,6 @@ val srcRect = Rect(srcLeft, srcTop, srcRight, srcBottom)
 val dstRect = Rect(0, 0, width, height)
 canvas.drawBitmap(bmp, srcRect, dstRect, pixelPaint)
 }
-// Lignes de 1px agrandies dans la loupe x20
 val cx = w / 2f
 val cy = h / 2f
 for (line in lines) {
@@ -570,16 +570,27 @@ val dx = (line.pos - focusX) * zoomFactor + cx
 if (dx in 0f..w) canvas.drawLine(dx, 0f, dx, h, linePaint)
 }
 }
-// Coordonnées en bas de la loupe
 canvas.drawRect(0f, h - 34f, w, h, bgPaint)
 canvas.drawText("X:${focusX.toInt()}  Y:${focusY.toInt()} (x20)", cx, h - 10f, textPaint)
 canvas.drawRect(2f, 2f, w - 2f, h - 2f, borderPaint)
 }
 }
 class RulerCanvasView(context: Context, val onUpdate: () -> Unit) : View(context) {
-val lines = mutableListOf()
+private val lines = ArrayList()
 var selectedLine: RulerLine? = null
 private var isDragging = false
+fun addLine(line: RulerLine) { lines.add(line) }
+fun lineCount(): Int = lines.size
+fun getAllLines(): Array = lines.toTypedArray()
+fun removeSelectedOrLast() {
+val sel = selectedLine
+if (sel != null) {
+lines.remove(sel)
+selectedLine = lines.lastOrNull()
+} else if (lines.isNotEmpty()) {
+lines.removeAt(lines.lastIndex)
+}
+}
 private val linePaint = Paint().apply {
 strokeWidth = 1f
 isAntiAlias = false
@@ -655,9 +666,16 @@ invalidate(); onUpdate(); return true
 }
 }
 }
-val hit = lines.minByOrNull { if (it.isHorizontal) abs(it.pos - y) else abs(it.pos - x) }
-val dist = hit?.let { if (it.isHorizontal) abs(it.pos - y) else abs(it.pos - x) } ?: 999f
-if (hit != null && dist < 45f) {
+var hit: RulerLine? = null
+var minDist = 999f
+for (line in lines) {
+val d = if (line.isHorizontal) abs(line.pos - y) else abs(line.pos - x)
+if (d < minDist) {
+minDist = d
+hit = line
+}
+}
+if (hit != null && minDist < 45f) {
 selectedLine = hit
 isDragging = true
 invalidate()
