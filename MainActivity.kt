@@ -244,18 +244,19 @@ class OverlayService : Service() {
     }
 
     private fun loadInitialLines() {
-        val defX = prefs.getInt("default_x", 300).toFloat()
-        val defY = prefs.getInt("default_y", 500).toFloat()
+        val defaultCenterX = (screenW * 0.42f).toInt()
+        val defaultCenterY = (screenH * 0.45f).toInt()
+        val defX = prefs.getInt("default_x", defaultCenterX).toFloat().coerceIn(80f, (screenW - 80).toFloat())
+        val defY = prefs.getInt("default_y", defaultCenterY).toFloat().coerceIn(150f, (screenH - 150).toFloat())
         val colorH = prefs.getInt("color_h", Color.RED)
         val colorV = prefs.getInt("color_v", Color.CYAN)
 
-        canvasView.addLine(RulerLine(true, defY, colorH))
-        canvasView.addLine(RulerLine(false, defX, colorV))
-        canvasView.selectedLine = canvasView.getAllLines().firstOrNull()
-        canvasView.invalidate()
-        updateCoordsDisplay()
-    }
-
+canvasView.addLine(RulerLine(true, defY, colorH))
+canvasView.addLine(RulerLine(false, defX, colorV))
+canvasView.selectedLine = canvasView.getAllLines().firstOrNull()
+canvasView.invalidate()
+updateCoordsDisplay()
+}
 private fun setupCanvas() {
 canvasView = RulerCanvasView(this) {
 updateCoordsDisplay()
@@ -264,25 +265,36 @@ if (isLoupeActive) updateLoupe()
 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 canvasParams = WindowManager.LayoutParams(
-WindowManager.LayoutParams.MATCH_PARENT,
-WindowManager.LayoutParams.MATCH_PARENT,
+screenW,
+screenH,
 type,
-WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
 PixelFormat.TRANSLUCENT
-)
+).apply {
+gravity = Gravity.TOP or Gravity.START
+x = 0
+y = 0
+if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+}
+}
 wm.addView(canvasView, canvasParams)
 }
 private fun toggleTouchPassThrough(btn: Button) {
 isTouchEnabled = !isTouchEnabled
 if (isTouchEnabled) {
 canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 btn.text = "Tactile: ON"
 btn.setBackgroundColor(Color.parseColor("#AA009944"))
 } else {
 canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 btn.text = "Tactile: OFF"
 btn.setBackgroundColor(Color.parseColor("#AA666666"))
 }
@@ -355,8 +367,8 @@ cleanupAndStop()
 "Tactile: ON" to { toggleTouchPassThrough(touchBtn) },
 "+ H" to {
 val c = prefs.getInt("color_h", Color.RED)
-val y = prefs.getInt("default_y", 400).toFloat() + (canvasView.lineCount() * 30)
-val newLine = RulerLine(true, y, c)
+val y = (screenH * 0.35f) + (canvasView.lineCount() * 40f)
+val newLine = RulerLine(true, y.coerceAtMost(screenH - 120f), c)
 canvasView.addLine(newLine)
 canvasView.selectedLine = newLine
 canvasView.invalidate()
@@ -365,8 +377,8 @@ if (isLoupeActive) updateLoupe()
 },
 "+ V" to {
 val c = prefs.getInt("color_v", Color.CYAN)
-val x = prefs.getInt("default_x", 300).toFloat() + (canvasView.lineCount() * 30)
-val newLine = RulerLine(false, x, c)
+val x = (screenW * 0.35f) + (canvasView.lineCount() * 40f)
+val newLine = RulerLine(false, x.coerceAtMost(screenW - 120f), c)
 canvasView.addLine(newLine)
 canvasView.selectedLine = newLine
 canvasView.invalidate()
@@ -534,12 +546,12 @@ setPadding(40, 30, 40, 20)
 val inputX = EditText(this).apply {
 hint = "Valeur X de base (px)"
 inputType = InputType.TYPE_CLASS_NUMBER
-setText(prefs.getInt("default_x", 300).toString())
+setText(prefs.getInt("default_x", (screenW * 0.42f).toInt()).toString())
 }
 val inputY = EditText(this).apply {
 hint = "Valeur Y de base (px)"
 inputType = InputType.TYPE_CLASS_NUMBER
-setText(prefs.getInt("default_y", 500).toString())
+setText(prefs.getInt("default_y", (screenH * 0.45f).toInt()).toString())
 }
 val colors = mapOf(
 "Rouge" to Color.RED,
@@ -583,8 +595,8 @@ val dialog = AlertDialog.Builder(this)
 .setTitle("Paramètres de précision")
 .setView(layout)
 .setPositiveButton("Enregistrer") { _, _ ->
-val newX = inputX.text.toString().toIntOrNull() ?: 300
-val newY = inputY.text.toString().toIntOrNull() ?: 500
+val newX = inputX.text.toString().toIntOrNull() ?: (screenW * 0.42f).toInt()
+val newY = inputY.text.toString().toIntOrNull() ?: (screenH * 0.45f).toInt()
 val chosenH = colors[colorNames[spinH.selectedItemPosition]] ?: Color.RED
 val chosenV = colors[colorNames[spinV.selectedItemPosition]] ?: Color.CYAN
 prefs.edit()
@@ -766,11 +778,11 @@ if (line.isHorizontal) {
 val cx = width / 2f
 val yUp = (line.pos - 75f).coerceAtLeast(50f)
 val yDown = (line.pos + 75f).coerceAtMost(height - 50f)
-if (abs(x - cx) < 50f && abs(y - yUp) < 50f) {
+if (abs(x - cx) < 55f && abs(y - yUp) < 55f) {
 line.pos = (line.pos - 1f).coerceAtLeast(0f)
 invalidate(); onUpdate(); return true
 }
-if (abs(x - cx) < 50f && abs(y - yDown) < 50f) {
+if (abs(x - cx) < 55f && abs(y - yDown) < 55f) {
 line.pos = (line.pos + 1f).coerceAtMost(height.toFloat())
 invalidate(); onUpdate(); return true
 }
@@ -778,11 +790,11 @@ invalidate(); onUpdate(); return true
 val cy = height / 2f
 val xLeft = (line.pos - 75f).coerceAtLeast(50f)
 val xRight = (line.pos + 75f).coerceAtMost(width - 50f)
-if (abs(x - xLeft) < 50f && abs(y - cy) < 50f) {
+if (abs(x - xLeft) < 55f && abs(y - cy) < 55f) {
 line.pos = (line.pos - 1f).coerceAtLeast(0f)
 invalidate(); onUpdate(); return true
 }
-if (abs(x - xRight) < 50f && abs(y - cy) < 50f) {
+if (abs(x - xRight) < 55f && abs(y - cy) < 55f) {
 line.pos = (line.pos + 1f).coerceAtMost(width.toFloat())
 invalidate(); onUpdate(); return true
 }
@@ -797,7 +809,7 @@ minDist = d
 hit = line
 }
 }
-if (hit != null && minDist < 45f) {
+if (hit != null && minDist < 70f) {
 selectedLine = hit
 isDragging = true
 invalidate()
