@@ -23,6 +23,12 @@ jobs:
         run: |
           mkdir -p app/src/main/java/com/pixel/ruler
           cp MainActivity.kt app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/Array = emptyArray()/Array<RulerLine> = emptyArray()/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/allLines: Array)/allLines: Array<RulerLine>)/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/ArrayList()/ArrayList<RulerLine>()/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/getAllLines(): Array/getAllLines(): Array<RulerLine>/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/allLines.filter { it.isHorizontal }/allLines.filter { line -> line.isHorizontal }/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/allLines.filter { !it.isHorizontal }/allLines.filter { line -> !line.isHorizontal }/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
 
           cat << 'EOF' > settings.gradle
           rootProject.name = "PixelRuler"
