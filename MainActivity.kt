@@ -12,7 +12,9 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
 import android.util.DisplayMetrics
@@ -27,38 +29,59 @@ class MainActivity : Activity() {
             val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             startActivityForResult(intent, 1001)
         } else {
-            requestScreenCapture()
+            launchOverlayDirectly()
         }
     }
 
-    private fun requestScreenCapture() {
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        startActivityForResult(mpm.createScreenCaptureIntent(), 1002)
+    private fun launchOverlayDirectly() {
+        val serviceIntent = Intent(this, OverlayService::class.java).apply {
+            action = "ACTION_START_OR_SHOW"
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+        finish()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 1001) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
-                requestScreenCapture()
+                launchOverlayDirectly()
             } else {
                 Toast.makeText(this, "Permission overlay requise", Toast.LENGTH_LONG).show()
                 finish()
             }
-        } else if (requestCode == 1002) {
+        }
+    }
+}
+
+class LoupePermissionActivity : Activity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(mpm.createScreenCaptureIntent(), 2002)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 2002 && resultCode == RESULT_OK && data != null) {
             val serviceIntent = Intent(this, OverlayService::class.java).apply {
-                if (resultCode == RESULT_OK && data != null) {
-                    putExtra("RESULT_CODE", resultCode)
-                    putExtra("DATA", data)
-                }
+                action = "ACTION_INIT_LOUPE"
+                putExtra("RESULT_CODE", resultCode)
+                putExtra("DATA", data)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent)
             } else {
                 startService(serviceIntent)
             }
-            finish()
+        } else {
+            Toast.makeText(this, "Autorisation écran refusée pour la loupe", Toast.LENGTH_SHORT).show()
         }
+        finish()
     }
 }
 
@@ -75,6 +98,8 @@ class OverlayService : Service() {
     private lateinit var loupeView: LoupeView
     private lateinit var loupeParams: WindowManager.LayoutParams
 
+    private var loupeBtnRef: Button? = null
+    private var viewsAdded = false
     private var isPanelRight = true
     private var areCoordsFloating = false
     private var isLoupeActive = false
@@ -87,6 +112,7 @@ class OverlayService : Service() {
     private var screenW = 1080
     private var screenH = 2400
     private var screenDpi = 420
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val prefs by lazy { getSharedPreferences("PixelRulerPrefs", Context.MODE_PRIVATE) }
 
@@ -104,27 +130,42 @@ class OverlayService : Service() {
         screenH = metrics.heightPixels
         screenDpi = metrics.densityDpi
 
+        initAllViews()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForegroundNotification()
+        if (!viewsAdded) {
+            initAllViews()
+        }
+
+        if (intent?.action == "ACTION_INIT_LOUPE") {
+            val code = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
+            val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra("DATA", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra("DATA")
+            }
+            if (code == Activity.RESULT_OK && data != null) {
+                setupMediaProjection(code, data)
+                isLoupeActive = true
+                loupeView.visibility = View.VISIBLE
+                loupeBtnRef?.setBackgroundColor(Color.parseColor("#AA0088CC"))
+                mainHandler.postDelayed({ updateLoupe() }, 250)
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun initAllViews() {
+        if (viewsAdded) return
         setupCanvas()
         setupLoupe()
         setupCoordsBox()
         setupSidePanel()
         loadInitialLines()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val code = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
-        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent?.getParcelableExtra("DATA", Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent?.getParcelableExtra("DATA")
-        }
-        if (code == Activity.RESULT_OK && data != null && mediaProjection == null) {
-            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = mpm.getMediaProjection(code, data)
-            setupVirtualDisplay()
-        }
-        return START_NOT_STICKY
+        viewsAdded = true
     }
 
     private fun startForegroundNotification() {
@@ -137,7 +178,7 @@ class OverlayService : Service() {
         val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("PixelRuler actif")
-                .setContentText("Règle de précision et loupe x20 en cours")
+                .setContentText("Règle de précision en cours")
                 .setSmallIcon(android.R.drawable.ic_menu_crop)
                 .build()
         } else {
@@ -150,27 +191,52 @@ class OverlayService : Service() {
         startForeground(1, notif)
     }
 
-    private fun setupVirtualDisplay() {
+    private fun setupMediaProjection(code: Int, data: Intent) {
+        virtualDisplay?.release()
+        imageReader?.close()
+        mediaProjection?.stop()
+
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = mpm.getMediaProjection(code, data)
+
+        // Obligatoire sur Android 14+ avant createVirtualDisplay
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                mainHandler.post {
+                    isLoupeActive = false
+                    if (viewsAdded) {
+                        loupeView.visibility = View.GONE
+                        loupeBtnRef?.setBackgroundColor(Color.parseColor("#44FFFFFF"))
+                    }
+                }
+            }
+        }, mainHandler)
+
         imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val plane = image.planes.first()
+                val buffer = plane.buffer
+                val pixelStride = plane.pixelStride
+                val rowStride = plane.rowStride
+                val rowPadding = rowStride - pixelStride * screenW
+                val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
+                bmp.copyPixelsFromBuffer(buffer)
+                screenBitmap = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
+                if (isLoupeActive) {
+                    mainHandler.post { refreshLoupeDisplay() }
+                }
+            } finally {
+                image.close()
+            }
+        }, mainHandler)
+
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "PixelRulerCapture", screenW, screenH, screenDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, null
+            imageReader?.surface, null, mainHandler
         )
-    }
-
-    private fun captureScreenFrame(): Bitmap? {
-        val image = imageReader?.acquireLatestImage() ?: return screenBitmap
-        val plane = image.planes.first()
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * screenW
-        val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
-        bmp.copyPixelsFromBuffer(buffer)
-        image.close()
-        screenBitmap = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
-        return screenBitmap
     }
 
     private fun loadInitialLines() {
@@ -191,59 +257,54 @@ class OverlayService : Service() {
             updateCoordsDisplay()
             if (isLoupeActive) updateLoupe()
         }
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-
-        canvasParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-        wm.addView(canvasView, canvasParams)
-    }
-
-    private fun toggleTouchPassThrough(btn: Button) {
-        isTouchEnabled = !isTouchEnabled
-        if (isTouchEnabled) {
-            canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-            btn.text = "Tactile: ON"
-            btn.setBackgroundColor(Color.parseColor("#AA009944"))
-        } else {
-            canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-            btn.text = "Tactile: OFF"
-            btn.setBackgroundColor(Color.parseColor("#AA666666"))
-        }
-        wm.updateViewLayout(canvasView, canvasParams)
-        canvasView.showArrows = isTouchEnabled
-        canvasView.invalidate()
-    }
-
-    private fun setupLoupe() {
-        loupeView = LoupeView(this)
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-
-        loupeParams = WindowManager.LayoutParams(
-            280, 280, type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 40
-            y = 260
-        }
-
-        loupeView.setOnTouchListener(object : View.OnTouchListener {
-            var initX = 0; var initY = 0; var touchX = 0f; var touchY = 0f
-            override fun onTouch(v: View, event: MotionEvent): Boolean {
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        initX = loupeParams.x; initY = loupeParams.y
+val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+canvasParams = WindowManager.LayoutParams(
+WindowManager.LayoutParams.MATCH_PARENT,
+WindowManager.LayoutParams.MATCH_PARENT,
+type,
+WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+PixelFormat.TRANSLUCENT
+)
+wm.addView(canvasView, canvasParams)
+}
+private fun toggleTouchPassThrough(btn: Button) {
+isTouchEnabled = !isTouchEnabled
+if (isTouchEnabled) {
+canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+btn.text = "Tactile: ON"
+btn.setBackgroundColor(Color.parseColor("#AA009944"))
+} else {
+canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+btn.text = "Tactile: OFF"
+btn.setBackgroundColor(Color.parseColor("#AA666666"))
+}
+wm.updateViewLayout(canvasView, canvasParams)
+canvasView.showArrows = isTouchEnabled
+canvasView.invalidate()
+}
+private fun setupLoupe() {
+loupeView = LoupeView(this)
+val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+loupeParams = WindowManager.LayoutParams(
+280, 280, type,
+WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+PixelFormat.TRANSLUCENT
+).apply {
+gravity = Gravity.TOP or Gravity.START
+x = 40
+y = 260
+}
+loupeView.setOnTouchListener(object : View.OnTouchListener {
+var initX = 0; var initY = 0; var touchX = 0f; var touchY = 0f
+override fun onTouch(v: View, event: MotionEvent): Boolean {
+when (event.action) {
+MotionEvent.ACTION_DOWN -> {
+initX = loupeParams.x; initY = loupeParams.y
 touchX = event.rawX; touchY = event.rawY
 return true
 }
@@ -262,6 +323,9 @@ wm.addView(loupeView, loupeParams)
 }
 private fun updateLoupe() {
 if (!isLoupeActive) return
+refreshLoupeDisplay()
+}
+private fun refreshLoupeDisplay() {
 val allLines = canvasView.getAllLines()
 var vPos = screenW / 2f
 var hPos = screenH / 2f
@@ -271,8 +335,7 @@ if (line.isHorizontal) hPos = line.pos else vPos = line.pos
 val sel = canvasView.selectedLine
 val targetX = if (sel != null && !sel.isHorizontal) sel.pos else vPos
 val targetY = if (sel != null && sel.isHorizontal) sel.pos else hPos
-val bmp = captureScreenFrame()
-loupeView.updateData(bmp, targetX, targetY, allLines)
+loupeView.updateData(screenBitmap, targetX, targetY, allLines)
 }
 private fun setupSidePanel() {
 panelLayout = LinearLayout(this).apply {
@@ -280,10 +343,11 @@ orientation = LinearLayout.VERTICAL
 setBackgroundColor(Color.parseColor("#DD1A1A1A"))
 setPadding(14, 18, 14, 18)
 }
-lateinit var loupeBtn: Button
 lateinit var touchBtn: Button
 val buttons = listOf(
-"Off" to { stopSelf() },
+"Off" to {
+cleanupAndStop()
+},
 "Tactile: ON" to { toggleTouchPassThrough(touchBtn) },
 "+ H" to {
 val c = prefs.getInt("color_h", Color.RED)
@@ -312,10 +376,17 @@ updateCoordsDisplay()
 if (isLoupeActive) updateLoupe()
 },
 "Loupe" to {
+if (mediaProjection == null) {
+val permIntent = Intent(this, LoupePermissionActivity::class.java).apply {
+addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+}
+startActivity(permIntent)
+} else {
 isLoupeActive = !isLoupeActive
 loupeView.visibility = if (isLoupeActive) View.VISIBLE else View.GONE
-loupeBtn.setBackgroundColor(if (isLoupeActive) Color.parseColor("#AA0088CC") else Color.parseColor("#44FFFFFF"))
+loupeBtnRef?.setBackgroundColor(if (isLoupeActive) Color.parseColor("#AA0088CC") else Color.parseColor("#44FFFFFF"))
 if (isLoupeActive) updateLoupe()
+}
 },
 "Other side" to {
 isPanelRight = !isPanelRight
@@ -345,7 +416,7 @@ val lp = LinearLayout.LayoutParams(250, 96).apply { setMargins(0, 6, 0, 6) }
 layoutParams = lp
 setOnClickListener { action() }
 }
-if (label == "Loupe") loupeBtn = btn
+if (label == "Loupe") loupeBtnRef = btn
 if (label == "Tactile: ON") touchBtn = btn
 panelLayout.addView(btn)
 }
@@ -534,15 +605,26 @@ WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutPar
 dialog.window?.setType(type)
 dialog.show()
 }
-override fun onDestroy() {
-super.onDestroy()
+private fun cleanupAndStop() {
 virtualDisplay?.release()
+virtualDisplay = null
 imageReader?.close()
+imageReader = null
 mediaProjection?.stop()
-if (::canvasView.isInitialized) wm.removeView(canvasView)
-if (::panelLayout.isInitialized) wm.removeView(panelLayout)
-if (::coordsBox.isInitialized) wm.removeView(coordsBox)
-if (::loupeView.isInitialized) wm.removeView(loupeView)
+mediaProjection = null
+if (viewsAdded) {
+try { wm.removeViewImmediate(canvasView) } catch (: Exception) {}
+try { wm.removeViewImmediate(panelLayout) } catch (: Exception) {}
+try { wm.removeViewImmediate(coordsBox) } catch (: Exception) {}
+try { wm.removeViewImmediate(loupeView) } catch (: Exception) {}
+viewsAdded = false
+}
+stopForeground(STOP_FOREGROUND_REMOVE)
+stopSelf()
+}
+override fun onDestroy() {
+cleanupAndStop()
+super.onDestroy()
 }
 }
 class LoupeView(context: Context) : View(context) {
