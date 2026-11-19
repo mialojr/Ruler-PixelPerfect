@@ -1,12 +1,3 @@
-
----
-
-### Fichier 2 : Le script automatique (`.github/workflows/build.yml`)
-1. Retournez à l'accueil de votre dépôt GitHub et cliquez de nouveau sur **Add file** > **Create new file**.
-2. Dans la case du nom du fichier, tapez exactement : `.github/workflows/build.yml` (les `/` vont créer les dossiers automatiquement).
-3. Collez le script ci-dessous et cliquez sur **Commit changes** :
-
-```yaml
 name: Build Android APK
 
 on:
@@ -91,7 +82,7 @@ jobs:
           EOF
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          <manifest xmlns:android="http://android.com">
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
               <application
                   android:label="PixelRuler"
@@ -120,4 +111,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PixelRuler-APK
-          path: app/build/outputs/apk/
+          path: app/build/outputs/apk/debug/app-debug.apk
