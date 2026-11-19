@@ -102,6 +102,10 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
+                                    <activity
+                      android:name=".LoupePermissionActivity"
+                      android:exported="false"/>
+
                   <service
                       android:name=".OverlayService"
                       android:foregroundServiceType="mediaProjection"
