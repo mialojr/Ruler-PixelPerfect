@@ -1,17 +1,21 @@
 package com.pixel.ruler
 
-import android.app.Activity
-import android.app.AlertDialog
-import android.app.Service
+import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.graphics.*
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
 import android.text.InputType
+import android.util.DisplayMetrics
 import android.view.*
 import android.widget.*
 import kotlin.math.abs
@@ -21,27 +25,40 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-            startActivityForResult(intent, 1234)
+            startActivityForResult(intent, 1001)
         } else {
-            startOverlayAndFinish()
+            requestScreenCapture()
         }
+    }
+
+    private fun requestScreenCapture() {
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(mpm.createScreenCaptureIntent(), 1002)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 1234) {
+        if (requestCode == 1001) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
-                startOverlayAndFinish()
+                requestScreenCapture()
             } else {
                 Toast.makeText(this, "Permission overlay requise", Toast.LENGTH_LONG).show()
                 finish()
             }
+        } else if (requestCode == 1002) {
+            val serviceIntent = Intent(this, OverlayService::class.java).apply {
+                if (resultCode == RESULT_OK && data != null) {
+                    putExtra("RESULT_CODE", resultCode)
+                    putExtra("DATA", data)
+                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            finish()
         }
-    }
-
-    private fun startOverlayAndFinish() {
-        startService(Intent(this, OverlayService::class.java))
-        finish()
     }
 }
 
@@ -54,8 +71,20 @@ class OverlayService : Service() {
     private lateinit var panelParams: WindowManager.LayoutParams
     private lateinit var coordsBox: LinearLayout
     private lateinit var coordsParams: WindowManager.LayoutParams
+    private lateinit var loupeView: LoupeView
+    private lateinit var loupeParams: WindowManager.LayoutParams
+
     private var isPanelRight = true
     private var areCoordsFloating = false
+    private var isLoupeActive = false
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var screenBitmap: Bitmap? = null
+    private var screenW = 1080
+    private var screenH = 2400
+    private var screenDpi = 420
 
     private val prefs by lazy { getSharedPreferences("PixelRulerPrefs", Context.MODE_PRIVATE) }
 
@@ -63,12 +92,83 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        startForegroundNotification()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        screenW = metrics.widthPixels
+        screenH = metrics.heightPixels
+        screenDpi = metrics.densityDpi
+
         setupCanvas()
+        setupLoupe()
         setupCoordsBox()
         setupSidePanel()
         loadInitialLines()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val code = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableExtra("DATA", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableExtra("DATA")
+        }
+        if (code == Activity.RESULT_OK && data != null && mediaProjection == null) {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = mpm.getMediaProjection(code, data)
+            setupVirtualDisplay()
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun startForegroundNotification() {
+        val channelId = "pixel_ruler_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "PixelRuler Overlay", NotificationManager.IMPORTANCE_LOW)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(channel)
+        }
+        val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+                .setContentTitle("PixelRuler actif")
+                .setContentText("Règle de précision et loupe x20 en cours")
+                .setSmallIcon(android.R.drawable.ic_menu_crop)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+                .setContentTitle("PixelRuler actif")
+                .setSmallIcon(android.R.drawable.ic_menu_crop)
+                .build()
+        }
+        startForeground(1, notif)
+    }
+
+    private fun setupVirtualDisplay() {
+        imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "PixelRulerCapture", screenW, screenH, screenDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader?.surface, null, null
+        )
+    }
+
+    private fun captureScreenFrame(): Bitmap? {
+        val image = imageReader?.acquireLatestImage() ?: return screenBitmap
+        val planes = image.planes
+        val buffer = planes.buffer
+        val pixelStride = planes.pixelStride
+        val rowStride = planes.rowStride
+        val rowPadding = rowStride - pixelStride * screenW
+        val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
+        bmp.copyPixelsFromBuffer(buffer)
+        image.close()
+        screenBitmap = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
+        return screenBitmap
     }
 
     private fun loadInitialLines() {
@@ -79,12 +179,16 @@ class OverlayService : Service() {
 
         canvasView.lines.add(RulerLine(true, defY, colorH))
         canvasView.lines.add(RulerLine(false, defX, colorV))
+        canvasView.selectedLine = canvasView.lines.first()
         canvasView.invalidate()
         updateCoordsDisplay()
     }
 
     private fun setupCanvas() {
-        canvasView = RulerCanvasView(this) { updateCoordsDisplay() }
+        canvasView = RulerCanvasView(this) {
+            updateCoordsDisplay()
+            if (isLoupeActive) updateLoupe()
+        }
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 
@@ -98,114 +202,34 @@ class OverlayService : Service() {
         wm.addView(canvasView, params)
     }
 
-    private fun setupSidePanel() {
-        panelLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#CC1A1A1A"))
-            setPadding(12, 20, 12, 20)
-        }
-
-        val buttons = listOf(
-            "Off" to { stopSelf() },
-            "+ H" to {
-                val c = prefs.getInt("color_h", Color.RED)
-                val y = prefs.getInt("default_y", 400).toFloat() + (canvasView.lines.size * 30)
-                canvasView.lines.add(RulerLine(true, y, c))
-                canvasView.selectedLine = canvasView.lines.last()
-                canvasView.invalidate()
-                updateCoordsDisplay()
-            },
-            "+ V" to {
-                val c = prefs.getInt("color_v", Color.CYAN)
-                val x = prefs.getInt("default_x", 300).toFloat() + (canvasView.lines.size * 30)
-                canvasView.lines.add(RulerLine(false, x, c))
-                canvasView.selectedLine = canvasView.lines.last()
-                canvasView.invalidate()
-                updateCoordsDisplay()
-            },
-            "-" to {
-                if (canvasView.selectedLine != null) {
-                    canvasView.lines.remove(canvasView.selectedLine)
-                    canvasView.selectedLine = canvasView.lines.lastOrNull()
-                } else if (canvasView.lines.isNotEmpty()) {
-                    canvasView.lines.removeAt(canvasView.lines.lastIndex)
-                }
-                canvasView.invalidate()
-                updateCoordsDisplay()
-            },
-            "Other side" to {
-                isPanelRight = !isPanelRight
-                panelParams.gravity = (if (isPanelRight) Gravity.END else Gravity.START) or Gravity.CENTER_VERTICAL
-                wm.updateViewLayout(panelLayout, panelParams)
-                if (!areCoordsFloating) dockCoordsBox()
-            },
-            "Paramètres" to { openSettingsDialog() }
-        )
-
-        buttons.forEach { (label, action) ->
-            val btn = Button(this).apply {
-                text = label
-                textSize = 11f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(if (label == "Off") Color.parseColor("#99CC0000") else Color.parseColor("#44FFFFFF"))
-                val lp = LinearLayout.LayoutParams(170, 95).apply { setMargins(0, 6, 0, 6) }
-                layoutParams = lp
-                setOnClickListener { action() }
-            }
-            panelLayout.addView(btn)
-        }
-
+    private fun setupLoupe() {
+        loupeView = LoupeView(this)
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 
-        panelParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
-        }
-        wm.addView(panelLayout, panelParams)
-    }
-
-    private fun setupCoordsBox() {
-        coordsBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#DD000000"))
-            setPadding(16, 12, 16, 12)
-        }
-
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-
-        coordsParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
+        loupeParams = WindowManager.LayoutParams(
+            280, 280, type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 20
-            y = 100
+            x = 40
+            y = 260
         }
 
-        coordsBox.setOnTouchListener(object : View.OnTouchListener {
+        loupeView.setOnTouchListener(object : View.OnTouchListener {
             var initX = 0; var initY = 0; var touchX = 0f; var touchY = 0f
             override fun onTouch(v: View, event: MotionEvent): Boolean {
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        areCoordsFloating = true
-                        initX = coordsParams.x; initY = coordsParams.y
+                        initX = loupeParams.x; initY = loupeParams.y
                         touchX = event.rawX; touchY = event.rawY
                         return true
                     }
                     MotionEvent.ACTION_MOVE -> {
-                        coordsParams.x = initX + (event.rawX - touchX).toInt()
-                        coordsParams.y = initY + (event.rawY - touchY).toInt()
-                        wm.updateViewLayout(coordsBox, coordsParams)
+                        loupeParams.x = initX + (event.rawX - touchX).toInt()
+                        loupeParams.y = initY + (event.rawY - touchY).toInt()
+                        wm.updateViewLayout(loupeView, loupeParams)
                         return true
                     }
                 }
@@ -213,51 +237,178 @@ class OverlayService : Service() {
             }
         })
 
-        wm.addView(coordsBox, coordsParams)
+        loupeView.visibility = View.GONE
+        wm.addView(loupeView, loupeParams)
     }
 
-    private fun dockCoordsBox() {
-        areCoordsFloating = false
-        coordsParams.x = if (isPanelRight) 20 else 220
-        coordsParams.y = 100
-        wm.updateViewLayout(coordsBox, coordsParams)
-    }
+    private fun updateLoupe() {
+        if (!isLoupeActive) return
+        val vLine = canvasView.lines.firstOrNull { !it.isHorizontal }
+        val hLine = canvasView.lines.firstOrNull { it.isHorizontal }
+        val sel = canvasView.selectedLine
 
-    private fun updateCoordsDisplay() {
-        coordsBox.removeAllViews()
-        val header = TextView(this).apply {
-            text = if (areCoordsFloating) "📌 Coords (Ranger)" else "📐 Coords (Glisser)"
-            textSize = 11f
-            setTextColor(Color.LTGRAY)
-            setOnClickListener { dockCoordsBox() }
-        }
-        coordsBox.addView(header)
-
-        val hLines = canvasView.lines.filter { it.isHorizontal }
-        val vLines = canvasView.lines.filter { !it.isHorizontal }
-
-        if (hLines.isEmpty() || vLines.isEmpty()) {
-            val info = TextView(this).apply {
-                text = "Ajoutez 1 H et 1 V"
-                textSize = 11f
-                setTextColor(Color.GRAY)
-            }
-            coordsBox.addView(info)
-            return
-        }
-
-        for (v in vLines) {
-            for (h in hLines) {
-                val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-                val tvX = TextView(this).apply {
-                    text = "X:${v.pos.toInt()} "
-                    textSize = 13f
-                    setTypeface(null, Typeface.BOLD)
-                    setTextColor(v.color)
-                }
-                val tvY = TextView(this).apply {
-                    text = "Y:${h.pos.toInt()}"
-                    textSize = 13f
+        val targetX = if (sel != null && !sel.isHorizontal) sel.pos else (vLine?.pos ?: (screenW / 2f))
+val targetY = if (sel != null && sel.isHorizontal) sel.pos else (hLine?.pos ?: (screenH / 2f))
+val bmp = captureScreenFrame()
+loupeView.updateData(bmp, targetX, targetY, canvasView.lines)
+}
+private fun setupSidePanel() {
+panelLayout = LinearLayout(this).apply {
+orientation = LinearLayout.VERTICAL
+setBackgroundColor(Color.parseColor("#CC1A1A1A"))
+setPadding(12, 16, 12, 16)
+}
+lateinit var loupeBtn: Button
+val buttons = listOf(
+"Off" to { stopSelf() },
+"+ H" to {
+val c = prefs.getInt("color_h", Color.RED)
+val y = prefs.getInt("default_y", 400).toFloat() + (canvasView.lines.size * 30)
+canvasView.lines.add(RulerLine(true, y, c))
+canvasView.selectedLine = canvasView.lines.last()
+canvasView.invalidate()
+updateCoordsDisplay()
+if (isLoupeActive) updateLoupe()
+},
+"+ V" to {
+val c = prefs.getInt("color_v", Color.CYAN)
+val x = prefs.getInt("default_x", 300).toFloat() + (canvasView.lines.size * 30)
+canvasView.lines.add(RulerLine(false, x, c))
+canvasView.selectedLine = canvasView.lines.last()
+canvasView.invalidate()
+updateCoordsDisplay()
+if (isLoupeActive) updateLoupe()
+},
+"-" to {
+if (canvasView.selectedLine != null) {
+canvasView.lines.remove(canvasView.selectedLine)
+canvasView.selectedLine = canvasView.lines.lastOrNull()
+} else if (canvasView.lines.isNotEmpty()) {
+canvasView.lines.removeAt(canvasView.lines.lastIndex)
+}
+canvasView.invalidate()
+updateCoordsDisplay()
+if (isLoupeActive) updateLoupe()
+},
+"Loupe" to {
+isLoupeActive = !isLoupeActive
+loupeView.visibility = if (isLoupeActive) View.VISIBLE else View.GONE
+loupeBtn.setBackgroundColor(if (isLoupeActive) Color.parseColor("#AA0088CC") else Color.parseColor("#44FFFFFF"))
+if (isLoupeActive) updateLoupe()
+},
+"Other side" to {
+isPanelRight = !isPanelRight
+panelParams.gravity = (if (isPanelRight) Gravity.END else Gravity.START) or Gravity.CENTER_VERTICAL
+wm.updateViewLayout(panelLayout, panelParams)
+if (!areCoordsFloating) dockCoordsBox()
+},
+"Paramètres" to { openSettingsDialog() }
+)
+buttons.forEach { (label, action) ->
+val btn = Button(this).apply {
+text = label
+textSize = 11f
+setTextColor(Color.WHITE)
+setBackgroundColor(if (label == "Off") Color.parseColor("#99CC0000") else Color.parseColor("#44FFFFFF"))
+val lp = LinearLayout.LayoutParams(170, 88).apply { setMargins(0, 5, 0, 5) }
+layoutParams = lp
+setOnClickListener { action() }
+}
+if (label == "Loupe") loupeBtn = btn
+panelLayout.addView(btn)
+}
+val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+panelParams = WindowManager.LayoutParams(
+WindowManager.LayoutParams.WRAP_CONTENT,
+WindowManager.LayoutParams.WRAP_CONTENT,
+type,
+WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+PixelFormat.TRANSLUCENT
+).apply {
+gravity = Gravity.END or Gravity.CENTER_VERTICAL
+}
+wm.addView(panelLayout, panelParams)
+}
+private fun setupCoordsBox() {
+coordsBox = LinearLayout(this).apply {
+orientation = LinearLayout.VERTICAL
+setBackgroundColor(Color.parseColor("#DD000000"))
+setPadding(16, 12, 16, 12)
+}
+val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+coordsParams = WindowManager.LayoutParams(
+WindowManager.LayoutParams.WRAP_CONTENT,
+WindowManager.LayoutParams.WRAP_CONTENT,
+type,
+WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+PixelFormat.TRANSLUCENT
+).apply {
+gravity = Gravity.TOP or Gravity.START
+x = 20
+y = 100
+}
+coordsBox.setOnTouchListener(object : View.OnTouchListener {
+var initX = 0; var initY = 0; var touchX = 0f; var touchY = 0f
+override fun onTouch(v: View, event: MotionEvent): Boolean {
+when (event.action) {
+MotionEvent.ACTION_DOWN -> {
+areCoordsFloating = true
+initX = coordsParams.x; initY = coordsParams.y
+touchX = event.rawX; touchY = event.rawY
+return true
+}
+MotionEvent.ACTION_MOVE -> {
+coordsParams.x = initX + (event.rawX - touchX).toInt()
+coordsParams.y = initY + (event.rawY - touchY).toInt()
+wm.updateViewLayout(coordsBox, coordsParams)
+return true
+}
+}
+return false
+}
+})
+wm.addView(coordsBox, coordsParams)
+}
+private fun dockCoordsBox() {
+areCoordsFloating = false
+coordsParams.x = if (isPanelRight) 20 else 220
+coordsParams.y = 100
+wm.updateViewLayout(coordsBox, coordsParams)
+}
+private fun updateCoordsDisplay() {
+coordsBox.removeAllViews()
+val header = TextView(this).apply {
+text = if (areCoordsFloating) "📌 Coords (Ranger)" else "📐 Coords (Glisser)"
+textSize = 11f
+setTextColor(Color.LTGRAY)
+setOnClickListener { dockCoordsBox() }
+}
+coordsBox.addView(header)
+val hLines = canvasView.lines.filter { it.isHorizontal }
+val vLines = canvasView.lines.filter { !it.isHorizontal }
+if (hLines.isEmpty() || vLines.isEmpty()) {
+val info = TextView(this).apply {
+text = "Ajoutez 1 H et 1 V"
+textSize = 11f
+setTextColor(Color.GRAY)
+}
+coordsBox.addView(info)
+return
+}
+for (v in vLines) {
+for (h in hLines) {
+val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+val tvX = TextView(this).apply {
+text = "X:${v.pos.toInt()} "
+textSize = 13f
+setTypeface(null, Typeface.BOLD)
+setTextColor(v.color)
+}
+val tvY = TextView(this).apply {
+text = "Y:${h.pos.toInt()}"
+textSize = 13f
 setTypeface(null, Typeface.BOLD)
 setTextColor(h.color)
 }
@@ -340,6 +491,7 @@ line.pos = if (line.isHorizontal) newY.toFloat() else newX.toFloat()
 }
 canvasView.invalidate()
 updateCoordsDisplay()
+if (isLoupeActive) updateLoupe()
 Toast.makeText(this, "Paramètres sauvegardés", Toast.LENGTH_SHORT).show()
 }
 .setNegativeButton("Annuler", null)
@@ -351,9 +503,77 @@ dialog.show()
 }
 override fun onDestroy() {
 super.onDestroy()
+virtualDisplay?.release()
+imageReader?.close()
+mediaProjection?.stop()
 if (::canvasView.isInitialized) wm.removeView(canvasView)
 if (::panelLayout.isInitialized) wm.removeView(panelLayout)
 if (::coordsBox.isInitialized) wm.removeView(coordsBox)
+if (::loupeView.isInitialized) wm.removeView(loupeView)
+}
+}
+class LoupeView(context: Context) : View(context) {
+private var sourceBitmap: Bitmap? = null
+private var focusX = 0f
+private var focusY = 0f
+private var lines: List = emptyList()
+private val zoomFactor = 20f
+private val borderPaint = Paint().apply {
+color = Color.WHITE
+style = Paint.Style.STROKE
+strokeWidth = 4f
+}
+private val bgPaint = Paint().apply { color = Color.parseColor("#EE111111") }
+private val pixelPaint = Paint().apply {
+isFilterBitmap = false
+isAntiAlias = false
+}
+private val linePaint = Paint().apply { strokeWidth = 2f }
+private val textPaint = Paint().apply {
+color = Color.WHITE
+textSize = 22f
+textAlign = Paint.Align.CENTER
+isFakeBoldText = true
+}
+fun updateData(bmp: Bitmap?, fx: Float, fy: Float, allLines: List) {
+sourceBitmap = bmp
+focusX = fx
+focusY = fy
+lines = allLines
+invalidate()
+}
+override fun onDraw(canvas: Canvas) {
+super.onDraw(canvas)
+val w = width.toFloat()
+val h = height.toFloat()
+canvas.drawRect(0f, 0f, w, h, bgPaint)
+sourceBitmap?.let { bmp ->
+val halfSpan = (w / zoomFactor) / 2f
+val srcLeft = (focusX - halfSpan).toInt().coerceIn(0, bmp.width - 1)
+val srcTop = (focusY - halfSpan).toInt().coerceIn(0, bmp.height - 1)
+val srcRight = (focusX + halfSpan).toInt().coerceIn(srcLeft + 1, bmp.width)
+val srcBottom = (focusY + halfSpan).toInt().coerceIn(srcTop + 1, bmp.height)
+val srcRect = Rect(srcLeft, srcTop, srcRight, srcBottom)
+val dstRect = Rect(0, 0, width, height)
+canvas.drawBitmap(bmp, srcRect, dstRect, pixelPaint)
+}
+// Lignes de 1px agrandies dans la loupe x20
+val cx = w / 2f
+val cy = h / 2f
+for (line in lines) {
+linePaint.color = line.color
+if (line.isHorizontal) {
+val dy = (line.pos - focusY) * zoomFactor + cy
+if (dy in 0f..h) canvas.drawLine(0f, dy, w, dy, linePaint)
+} else {
+val dx = (line.pos - focusX) * zoomFactor + cx
+if (dx in 0f..w) canvas.drawLine(dx, 0f, dx, h, linePaint)
+}
+}
+// Coordonnées en bas de la loupe
+canvas.drawRect(0f, h - 34f, w, h, bgPaint)
+canvas.drawText("X:${focusX.toInt()}  Y:${focusY.toInt()} (x20)", cx, h - 10f, textPaint)
+canvas.drawRect(2f, 2f, w - 2f, h - 2f, borderPaint)
 }
 }
 class RulerCanvasView(context: Context, val onUpdate: () -> Unit) : View(context) {
@@ -361,7 +581,7 @@ val lines = mutableListOf()
 var selectedLine: RulerLine? = null
 private var isDragging = false
 private val linePaint = Paint().apply {
-strokeWidth = 1f // Strictement 1 pixel d'épaisseur
+strokeWidth = 1f
 isAntiAlias = false
 }
 private val btnPaint = Paint().apply {
@@ -384,7 +604,6 @@ canvas.drawLine(0f, line.pos, width.toFloat(), line.pos, linePaint)
 canvas.drawLine(line.pos, 0f, line.pos, height.toFloat(), linePaint)
 }
 }
-// Flèches de précision 1px sur la ligne sélectionnée
 selectedLine?.let { line ->
 if (line.isHorizontal) {
 val cx = width / 2f
@@ -409,7 +628,6 @@ override fun onTouchEvent(event: MotionEvent): Boolean {
 val x = event.x
 val y = event.y
 if (event.action == MotionEvent.ACTION_DOWN) {
-// 1. Vérifier clic sur les flèches de précision 1px
 selectedLine?.let { line ->
 if (line.isHorizontal) {
 val cx = width / 2f
@@ -437,13 +655,13 @@ invalidate(); onUpdate(); return true
 }
 }
 }
-// 2. Sélectionner une ligne proche du doigt
 val hit = lines.minByOrNull { if (it.isHorizontal) abs(it.pos - y) else abs(it.pos - x) }
 val dist = hit?.let { if (it.isHorizontal) abs(it.pos - y) else abs(it.pos - x) } ?: 999f
 if (hit != null && dist < 45f) {
 selectedLine = hit
 isDragging = true
 invalidate()
+onUpdate()
 return true
 } else {
 selectedLine = null
