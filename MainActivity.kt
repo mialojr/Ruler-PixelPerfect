@@ -105,6 +105,7 @@ class OverlayService : Service() {
     private var areCoordsFloating = false
     private var isLoupeActive = false
     private var isTouchEnabled = true
+    private var isCapturingCleanFrame = false
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -151,9 +152,8 @@ class OverlayService : Service() {
                     promoteToForegroundMediaProjection()
                     setupMediaProjection(code, data)
                     isLoupeActive = true
-                    loupeView.visibility = View.VISIBLE
                     loupeBtnRef?.setBackgroundColor(Color.parseColor("#AA0088CC"))
-                    mainHandler.postDelayed({ updateLoupe() }, 300)
+                    captureUnderneathAndShowLoupe()
                 } catch (e: Exception) {
                     Toast.makeText(this, "Erreur loupe : ${e.message}", Toast.LENGTH_SHORT).show()
                 }
@@ -224,16 +224,18 @@ class OverlayService : Service() {
         imageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
-                val plane = image.planes.first()
-                val buffer = plane.buffer
-                val pixelStride = plane.pixelStride
-                val rowStride = plane.rowStride
-                val rowPadding = rowStride - pixelStride * screenW
-                val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
-                bmp.copyPixelsFromBuffer(buffer)
-                screenBitmap = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
-                if (isLoupeActive) {
-                    mainHandler.post { refreshLoupeDisplay() }
+                // On ne met à jour l'image de fond que lorsque la loupe est masquée pour éviter l'effet miroir blanc
+                if (loupeView.visibility != View.VISIBLE) {
+                    val plane = image.planes.first()
+                    val buffer = plane.buffer
+                    val pixelStride = plane.pixelStride
+                    val rowStride = plane.rowStride
+                    val rowPadding = rowStride - pixelStride * screenW
+                    val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
+                    bmp.copyPixelsFromBuffer(buffer)
+                    screenBitmap?.recycle()
+                    screenBitmap = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
+                    bmp.recycle()
                 }
             } finally {
                 image.close()
@@ -247,15 +249,26 @@ class OverlayService : Service() {
         )
     }
 
-    private fun loadInitialLines() {
-        val defaultCenterX = (screenW * 0.42f).toInt()
-        val defaultCenterY = (screenH * 0.45f).toInt()
-        val defX = prefs.getInt("default_x", defaultCenterX).toFloat().coerceIn(80f, (screenW - 80).toFloat())
-        val defY = prefs.getInt("default_y", defaultCenterY).toFloat().coerceIn(150f, (screenH - 150).toFloat())
-        val colorH = prefs.getInt("color_h", Color.RED)
+    // Masque brièvement l'overlay pour capturer uniquement l'application du dessous sans effet miroir
+    private fun captureUnderneathAndShowLoupe() {
+        if (!isLoupeActive || isCapturingCleanFrame) return
+        isCapturingCleanFrame = true
+loupeView.visibility = View.INVISIBLE
+canvasView.visibility = View.INVISIBLE
+mainHandler.postDelayed({
+loupeView.visibility = View.VISIBLE
+canvasView.visibility = View.VISIBLE
+isCapturingCleanFrame = false
+refreshLoupeDisplay()
+}, 90)
+}
+private fun loadInitialLines() {
+val defaultCenterX = (screenW * 0.42f).toFloat()
+val defaultCenterY = (screenH * 0.45f).toFloat()
+val colorH = prefs.getInt("color_h", Color.RED)
 val colorV = prefs.getInt("color_v", Color.CYAN)
-canvasView.addLine(RulerLine(true, defY, colorH))
-canvasView.addLine(RulerLine(false, defX, colorV))
+canvasView.addLine(RulerLine(true, defaultCenterY, colorH))
+canvasView.addLine(RulerLine(false, defaultCenterX, colorV))
 canvasView.selectedLine = canvasView.getAllLines().firstOrNull()
 canvasView.invalidate()
 updateCoordsDisplay()
@@ -263,7 +276,7 @@ updateCoordsDisplay()
 private fun setupCanvas() {
 canvasView = RulerCanvasView(this) {
 updateCoordsDisplay()
-if (isLoupeActive) updateLoupe()
+if (isLoupeActive) refreshLoupeDisplay()
 }
 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
@@ -304,6 +317,10 @@ btn.setBackgroundColor(Color.parseColor("#AA666666"))
 wm.updateViewLayout(canvasView, canvasParams)
 canvasView.showArrows = isTouchEnabled
 canvasView.invalidate()
+if (!isTouchEnabled && isLoupeActive) {
+// Rafraîchit l'image du dessous si on vient d'interagir avec l'écran
+mainHandler.postDelayed({ captureUnderneathAndShowLoupe() }, 200)
+}
 }
 private fun setupLoupe() {
 loupeView = RoundLoupeView(this) { dx, dy ->
@@ -314,7 +331,6 @@ refreshLoupeDisplay()
 }
 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-// Fenêtre 420x420 : cercle central de rayon 140px (centre à 210, 210) + orbite libre pour le point autour
 loupeParams = WindowManager.LayoutParams(
 420, 420, type,
 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -329,15 +345,16 @@ y = (screenH / 2) - 210
 loupeView.visibility = View.GONE
 wm.addView(loupeView, loupeParams)
 }
-private fun updateLoupe() {
-if (!isLoupeActive) return
-refreshLoupeDisplay()
-}
 private fun refreshLoupeDisplay() {
+if (!isLoupeActive) return
 val allLines = canvasView.getAllLines()
 val centerX = (loupeParams.x + 210).toFloat()
 val centerY = (loupeParams.y + 210).toFloat()
-loupeView.updateData(screenBitmap, centerX, centerY, allLines)
+val baseW = prefs.getInt("base_w", screenW)
+val baseH = prefs.getInt("base_h", screenH)
+val scaledX = (centerX * baseW / screenW.toFloat()).toInt()
+val scaledY = (centerY * baseH / screenH.toFloat()).toInt()
+loupeView.updateData(screenBitmap, centerX, centerY, scaledX, scaledY, allLines)
 }
 private fun setupSidePanel() {
 panelLayout = LinearLayout(this).apply {
@@ -359,7 +376,7 @@ canvasView.addLine(newLine)
 canvasView.selectedLine = newLine
 canvasView.invalidate()
 updateCoordsDisplay()
-if (isLoupeActive) updateLoupe()
+if (isLoupeActive) refreshLoupeDisplay()
 },
 "+ V" to {
 val c = prefs.getInt("color_v", Color.CYAN)
@@ -369,13 +386,13 @@ canvasView.addLine(newLine)
 canvasView.selectedLine = newLine
 canvasView.invalidate()
 updateCoordsDisplay()
-if (isLoupeActive) updateLoupe()
+if (isLoupeActive) refreshLoupeDisplay()
 },
 "-" to {
 canvasView.removeSelectedOrLast()
 canvasView.invalidate()
 updateCoordsDisplay()
-if (isLoupeActive) updateLoupe()
+if (isLoupeActive) refreshLoupeDisplay()
 },
 "Loupe" to {
 if (mediaProjection == null) {
@@ -385,9 +402,13 @@ addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 startActivity(permIntent)
 } else {
 isLoupeActive = !isLoupeActive
-loupeView.visibility = if (isLoupeActive) View.VISIBLE else View.GONE
-loupeBtnRef?.setBackgroundColor(if (isLoupeActive) Color.parseColor("#AA0088CC") else Color.parseColor("#44FFFFFF"))
-if (isLoupeActive) updateLoupe()
+if (isLoupeActive) {
+loupeBtnRef?.setBackgroundColor(Color.parseColor("#AA0088CC"))
+captureUnderneathAndShowLoupe()
+} else {
+loupeView.visibility = View.GONE
+loupeBtnRef?.setBackgroundColor(Color.parseColor("#44FFFFFF"))
+}
 }
 },
 "Other side" to {
@@ -484,9 +505,11 @@ wm.updateViewLayout(coordsBox, coordsParams)
 }
 private fun updateCoordsDisplay() {
 coordsBox.removeAllViews()
+val baseW = prefs.getInt("base_w", screenW)
+val baseH = prefs.getInt("base_h", screenH)
 val header = TextView(this).apply {
-text = if (areCoordsFloating) "📌 Coords (Ranger)" else "📐 Coords (Glisser)"
-textSize = 12f
+text = if (areCoordsFloating) "📌 Coords ($baseW×$baseH)" else "📐 Coords ($baseW×$baseH)"
+textSize = 11f
 setTextColor(Color.LTGRAY)
 setOnClickListener { dockCoordsBox() }
 }
@@ -505,15 +528,17 @@ return
 }
 for (v in vLines) {
 for (h in hLines) {
+val scaledX = (v.pos * baseW / screenW.toFloat()).toInt()
+val scaledY = (h.pos * baseH / screenH.toFloat()).toInt()
 val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 val tvX = TextView(this).apply {
-text = "X:${v.pos.toInt()} "
+text = "X:$scaledX "
 textSize = 14f
 setTypeface(null, Typeface.BOLD)
 setTextColor(v.color)
 }
 val tvY = TextView(this).apply {
-text = "Y:${h.pos.toInt()}"
+text = "Y:$scaledY"
 textSize = 14f
 setTypeface(null, Typeface.BOLD)
 setTextColor(h.color)
@@ -529,15 +554,15 @@ val layout = LinearLayout(this).apply {
 orientation = LinearLayout.VERTICAL
 setPadding(40, 30, 40, 20)
 }
-val inputX = EditText(this).apply {
-hint = "Valeur X de base (px)"
+val inputW = EditText(this).apply {
+hint = "Largeur X écran de base (px)"
 inputType = InputType.TYPE_CLASS_NUMBER
-setText(prefs.getInt("default_x", (screenW * 0.42f).toInt()).toString())
+setText(prefs.getInt("base_w", screenW).toString())
 }
-val inputY = EditText(this).apply {
-hint = "Valeur Y de base (px)"
+val inputH = EditText(this).apply {
+hint = "Hauteur Y écran de base (px)"
 inputType = InputType.TYPE_CLASS_NUMBER
-setText(prefs.getInt("default_y", (screenH * 0.45f).toInt()).toString())
+setText(prefs.getInt("base_h", screenH).toString())
 }
 val colors = mapOf(
 "Rouge" to Color.RED,
@@ -560,9 +585,9 @@ adapter = ArrayAdapter(this@OverlayService, android.R.layout.simple_spinner_drop
 val savedV = prefs.getInt("color_v", Color.CYAN)
 setSelection(colors.values.indexOf(savedV).coerceAtLeast(0))
 }
-layout.addView(TextView(this).apply { text = "Coordonnées de base (X / Y) :" })
-layout.addView(inputX)
-layout.addView(inputY)
+layout.addView(TextView(this).apply { text = "Taille d'écran de base (Largeur X / Hauteur Y) :" })
+layout.addView(inputW)
+layout.addView(inputH)
 layout.addView(lblH)
 layout.addView(spinH)
 layout.addView(lblV)
@@ -571,26 +596,23 @@ val dialog = AlertDialog.Builder(this)
 .setTitle("Paramètres de précision")
 .setView(layout)
 .setPositiveButton("Enregistrer") { _, _ ->
-val newX = inputX.text.toString().toIntOrNull() ?: (screenW * 0.42f).toInt()
-val newY = inputY.text.toString().toIntOrNull() ?: (screenH * 0.45f).toInt()
+val newW = (inputW.text.toString().toIntOrNull() ?: screenW).coerceAtLeast(1)
+val newH = (inputH.text.toString().toIntOrNull() ?: screenH).coerceAtLeast(1)
 val chosenH = colors[colorNames[spinH.selectedItemPosition]] ?: Color.RED
 val chosenV = colors[colorNames[spinV.selectedItemPosition]] ?: Color.CYAN
 prefs.edit()
-.putInt("default_x", newX)
-.putInt("default_y", newY)
+.putInt("base_w", newW)
+.putInt("base_h", newH)
 .putInt("color_h", chosenH)
 .putInt("color_v", chosenV)
 .apply()
 for (line in canvasView.getAllLines()) {
 line.color = if (line.isHorizontal) chosenH else chosenV
 }
-canvasView.selectedLine?.let { line ->
-line.pos = if (line.isHorizontal) newY.toFloat() else newX.toFloat()
-}
 canvasView.invalidate()
 updateCoordsDisplay()
-if (isLoupeActive) updateLoupe()
-Toast.makeText(this, "Paramètres sauvegardés", Toast.LENGTH_SHORT).show()
+if (isLoupeActive) refreshLoupeDisplay()
+Toast.makeText(this, "Paramètres sauvegardés ($newW×$newH)", Toast.LENGTH_SHORT).show()
 }
 .setNegativeButton("Annuler", null)
 .create()
@@ -627,6 +649,8 @@ class RoundLoupeView(context: Context, val onDrag: (Int, Int) -> Unit) : View(co
 private var sourceBitmap: Bitmap? = null
 private var focusX = 0f
 private var focusY = 0f
+private var displayX = 0
+private var displayY = 0
 private var lines: Array = emptyArray()
 private val zoomFactor = 20f
 private val radius = 140f
@@ -635,7 +659,7 @@ private val cy = 210f
 private val orbitRadius = 168f
 private var handleAngle = Math.toRadians(45.0).toFloat()
 private val handleRadius = 34f
-private var dragMode = 0 // 0: aucun, 1: déplacer la loupe, 2: faire tourner le point autour de la loupe
+private var dragMode = 0
 private var lastRawX = 0f
 private var lastRawY = 0f
 private val clipPath = Path().apply {
@@ -683,20 +707,22 @@ textAlign = Paint.Align.CENTER
 isFakeBoldText = true
 isAntiAlias = true
 }
-fun updateData(bmp: Bitmap?, fx: Float, fy: Float, allLines: Array) {
+fun updateData(bmp: Bitmap?, fx: Float, fy: Float, dispX: Int, dispY: Int, allLines: Array) {
 sourceBitmap = bmp
 focusX = fx
 focusY = fy
+displayX = dispX
+displayY = dispY
 lines = allLines
 invalidate()
 }
 override fun onDraw(canvas: Canvas) {
 super.onDraw(canvas)
-// 1. Contenu de la loupe découpé en cercle au centre (210, 210)
 canvas.save()
 canvas.clipPath(clipPath)
 canvas.drawCircle(cx, cy, radius, bgPaint)
 sourceBitmap?.let { bmp ->
+if (!bmp.isRecycled) {
 val diameter = radius * 2f
 val halfSpan = (diameter / zoomFactor) / 2f
 val srcLeft = (focusX - halfSpan).toInt().coerceIn(0, bmp.width - 1)
@@ -707,7 +733,8 @@ val srcRect = Rect(srcLeft, srcTop, srcRight, srcBottom)
 val dstRect = Rect((cx - radius).toInt(), (cy - radius).toInt(), (cx + radius).toInt(), (cy + radius).toInt())
 canvas.drawBitmap(bmp, srcRect, dstRect, pixelPaint)
 }
-// Lignes de mesure dans le cercle
+}
+// Lignes de mesure dessinées nettes par-dessus l'image agrandie
 for (line in lines) {
 linePaint.color = line.color
 if (line.isHorizontal) {
@@ -718,16 +745,12 @@ val dx = (line.pos - focusX) * zoomFactor + cx
 if (dx in (cx - radius)..(cx + radius)) canvas.drawLine(dx, cy - radius, dx, cy + radius, linePaint)
 }
 }
-// Viseur central
 canvas.drawLine(cx - 20f, cy, cx + 20f, cy, crossPaint)
 canvas.drawLine(cx, cy - 20f, cx, cy + 20f, crossPaint)
-// Coordonnées en bas du cercle
 canvas.drawRect(cx - 105f, cy + radius - 46f, cx + 105f, cy + radius, pillPaint)
-canvas.drawText("X:${focusX.toInt()} Y:${focusY.toInt()}", cx, cy + radius - 22f, textPaint)
+canvas.drawText("X:$displayX Y:$displayY", cx, cy + radius - 22f, textPaint)
 canvas.restore()
-// 2. Bordure blanche du cercle
 canvas.drawCircle(cx, cy, radius - 2f, borderPaint)
-// 3. Point poignée positionnable librement autour du cercle
 val hx = cx + orbitRadius * cos(handleAngle)
 val hy = cy + orbitRadius * sin(handleAngle)
 canvas.drawCircle(hx, hy, handleRadius, handlePaint)
@@ -758,7 +781,6 @@ return false
 }
 MotionEvent.ACTION_MOVE -> {
 if (dragMode == 1) {
-// Déplace la loupe entière via le point poignée
 val dx = (event.rawX - lastRawX).toInt()
 val dy = (event.rawY - lastRawY).toInt()
 lastRawX = event.rawX
@@ -766,7 +788,6 @@ lastRawY = event.rawY
 onDrag(dx, dy)
 return true
 } else if (dragMode == 2) {
-// Fait tourner le point poignée autour de la loupe si on glisse sur le bord
 val dCenter = hypot(x - cx, y - cy)
 if (dCenter > radius * 0.55f) {
 handleAngle = atan2(y - cy, x - cx)
