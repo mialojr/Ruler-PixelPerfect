@@ -104,6 +104,7 @@ jobs:
                   </activity>
                                     <activity
                       android:name=".LoupePermissionActivity"
+                       android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
                       android:exported="false"/>
 
                   <service
