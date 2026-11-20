@@ -1,32 +1,22 @@
 package com.pixel.ruler
 
-import android.app.*
+import android.app.Activity
+import android.app.AlertDialog
+import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
 import android.util.DisplayMetrics
 import android.view.*
 import android.widget.*
 import kotlin.math.abs
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.hypot
-import kotlin.math.sin
 
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,33 +50,6 @@ class MainActivity : Activity() {
     }
 }
 
-class LoupePermissionActivity : Activity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        startActivityForResult(mpm.createScreenCaptureIntent(), 2002)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 2002 && resultCode == RESULT_OK && data != null) {
-            val serviceIntent = Intent(this, OverlayService::class.java).apply {
-                action = "ACTION_INIT_LOUPE"
-                putExtra("RESULT_CODE", resultCode)
-                putExtra("DATA", data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-        } else {
-            Toast.makeText(this, "Autorisation écran refusée pour la loupe", Toast.LENGTH_SHORT).show()
-        }
-        finish()
-    }
-}
-
 data class RulerLine(val isHorizontal: Boolean, var pos: Float, var color: Int)
 
 class OverlayService : Service() {
@@ -96,26 +59,15 @@ class OverlayService : Service() {
     private lateinit var panelLayout: LinearLayout
     private lateinit var buttonsContainer: LinearLayout
     private lateinit var panelParams: WindowManager.LayoutParams
-    private lateinit var loupeView: RoundLoupeView
-    private lateinit var loupeParams: WindowManager.LayoutParams
 
-    private var loupeBtnRef: Button? = null
     private var collapseBtnRef: Button? = null
     private var viewsAdded = false
     private var isPanelRight = true
     private var isPanelCollapsed = false
-    private var isLoupeActive = false
     private var isUnderneathTouchOn = false
-    private var waitingForCleanFrame = false
 
-    private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var screenBitmap: Bitmap? = null
     private var screenW = 1080
     private var screenH = 2400
-    private var screenDpi = 420
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val prefs by lazy { getSharedPreferences("PixelRulerPrefs", Context.MODE_PRIVATE) }
 
@@ -130,7 +82,6 @@ class OverlayService : Service() {
         wm.defaultDisplay.getRealMetrics(metrics)
         screenW = metrics.widthPixels
         screenH = metrics.heightPixels
-        screenDpi = metrics.densityDpi
 
         initAllViews()
     }
@@ -139,34 +90,12 @@ class OverlayService : Service() {
         if (!viewsAdded) {
             initAllViews()
         }
-
-        if (intent?.action == "ACTION_INIT_LOUPE") {
-            val code = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
-            val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra("DATA", Intent::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra("DATA")
-            }
-            if (code == Activity.RESULT_OK && data != null) {
-                try {
-                    promoteToForegroundMediaProjection()
-                    setupMediaProjection(code, data)
-                    isLoupeActive = true
-                    loupeBtnRef?.background = createRoundedBg(Color.parseColor("#CC0284C7"), 20f)
-                    captureCleanBackground()
-                } catch (e: Exception) {
-                    Toast.makeText(this, "Erreur loupe : ${e.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
         return START_NOT_STICKY
     }
 
     private fun initAllViews() {
         if (viewsAdded) return
         setupCanvas()
-        setupLoupe()
         setupSidePanel()
         loadInitialLines()
         viewsAdded = true
@@ -183,321 +112,153 @@ class OverlayService : Service() {
         }
     }
 
-    private fun promoteToForegroundMediaProjection() {
-        val channelId = "pixel_ruler_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "PixelRuler Loupe", NotificationManager.IMPORTANCE_LOW)
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
-        }
-        val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, channelId)
-                .setContentTitle("PixelRuler Loupe x20")
-                .setContentText("Loupe ronde active")
-                .setSmallIcon(android.R.drawable.ic_menu_crop)
-                .build()
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-                .setContentTitle("PixelRuler Loupe x20")
-                .setSmallIcon(android.R.drawable.ic_menu_crop)
-                .build()
-        }
+    private fun loadInitialLines() {
+        val defaultCenterX = (screenW * 0.42f).toFloat()
+        val defaultCenterY = (screenH * 0.45f).toFloat()
+        val colorH = prefs.getInt("color_h", Color.RED)
+        val colorV = prefs.getInt("color_v", Color.CYAN)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(1, notif)
-        }
+        canvasView.baseW = prefs.getInt("base_w", screenW)
+        canvasView.baseH = prefs.getInt("base_h", screenH)
+        canvasView.screenW = screenW
+        canvasView.screenH = screenH
+
+        canvasView.addLine(RulerLine(true, defaultCenterY, colorH))
+        canvasView.addLine(RulerLine(false, defaultCenterX, colorV))
+        canvasView.selectedLine = canvasView.getAllLines().firstOrNull()
+        canvasView.invalidate()
     }
 
-    private fun setupMediaProjection(code: Int, data: Intent) {
-        virtualDisplay?.release()
-        imageReader?.close()
-        mediaProjection?.stop()
+    private fun setupCanvas() {
+        canvasView = RulerCanvasView(this)
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = mpm.getMediaProjection(code, data)
-
-        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                mainHandler.post {
-                    isLoupeActive = false
-                    mediaProjection = null
-                    if (viewsAdded) {
-                        loupeView.visibility = View.GONE
-                        loupeBtnRef?.background = createRoundedBg(Color.parseColor("#33FFFFFF"), 20f)
-                    }
-                }
+        canvasParams = WindowManager.LayoutParams(
+            screenW,
+            screenH,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
-        }, mainHandler)
+        }
+        wm.addView(canvasView, canvasParams)
     }
 
-    // Crée brièvement le VirtualDisplay pendant que nos vues sont masquées pour forcer Android à livrer une frame propre
-    private fun captureCleanBackground() {
-        if (!isLoupeActive || mediaProjection == null || waitingForCleanFrame) return
-        waitingForCleanFrame = true
+    private fun toggleUnderneathTouch(btn: Button) {
+        isUnderneathTouchOn = !isUnderneathTouchOn
+        if (isUnderneathTouchOn) {
+            canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            btn.text = "Tactile: ON"
+            btn.background = createRoundedBg(Color.parseColor("#CC16A34A"), 20f)
+        } else {
+            canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            btn.text = "Tactile: OFF"
+            btn.background = createRoundedBg(Color.parseColor("#66475569"), 20f)
+        }
+        wm.updateViewLayout(canvasView, canvasParams)
+        canvasView.showArrows = !isUnderneathTouchOn
+        canvasView.invalidate()
+    }
 
-        loupeView.visibility = View.INVISIBLE
-        canvasView.visibility = View.INVISIBLE
-        panelLayout.visibility = View.INVISIBLE
+    private fun setupSidePanel() {
+        panelLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createRoundedBg(Color.parseColor("#E6111827"), 32f, Color.parseColor("#44FFFFFF"))
+            setPadding(16, 16, 16, 16)
+            elevation = 12f
+        }
 
-        mainHandler.postDelayed({
-            try {
-                virtualDisplay?.release()
-                imageReader?.close()
+        val collapseBtn = Button(this).apply {
+            text = "Masquer ▸"
+            textSize = 11f
+            isAllCaps = false
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#CBD5E1"))
+            background = createRoundedBg(Color.parseColor("#33FFFFFF"), 18f)
+            setPadding(8, 0, 8, 0)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(235, 72).apply { setMargins(0, 0, 0, 8) }
+            setOnClickListener { toggleSidebarCollapse() }
+        }
+        collapseBtnRef = collapseBtn
+        panelLayout.addView(collapseBtn)
 
-                imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
-                imageReader?.setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    try {
-                        if (waitingForCleanFrame) {
-                            val plane = image.planes.first()
-                            val buffer = plane.buffer
-                            val pixelStride = plane.pixelStride
-                            val rowStride = plane.rowStride
-val rowPadding = rowStride - pixelStride * screenW
-val bmp = Bitmap.createBitmap(screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888)
-bmp.copyPixelsFromBuffer(buffer)
-screenBitmap?.recycle()
-screenBitmap = Bitmap.createBitmap(bmp, 0, 0, screenW, screenH)
-bmp.recycle()
-waitingForCleanFrame = false
-finishCleanCapture()
-}
-} finally {
-image.close()
-}
-}, mainHandler)
-virtualDisplay = mediaProjection?.createVirtualDisplay(
-"PixelRulerCapture", screenW, screenH, screenDpi,
-DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-imageReader?.surface, null, mainHandler
-)
-// Sécurité : réaffiche l'interface après 350ms même si aucune image n'est arrivée
-mainHandler.postDelayed({
-if (waitingForCleanFrame) {
-waitingForCleanFrame = false
-finishCleanCapture()
-}
-}, 350)
-} catch (e: Exception) {
-waitingForCleanFrame = false
-finishCleanCapture()
-}
-}, 80)
-}
-private fun finishCleanCapture() {
-virtualDisplay?.release()
-virtualDisplay = null
-panelLayout.visibility = View.VISIBLE
-canvasView.visibility = View.VISIBLE
-if (isLoupeActive) {
-loupeView.visibility = View.VISIBLE
-refreshLoupeDisplay()
-}
-}
-private fun loadInitialLines() {
-val defaultCenterX = (screenW * 0.42f).toFloat()
-val defaultCenterY = (screenH * 0.45f).toFloat()
-val colorH = prefs.getInt("color_h", Color.RED)
-val colorV = prefs.getInt("color_v", Color.CYAN)
-canvasView.baseW = prefs.getInt("base_w", screenW)
-canvasView.baseH = prefs.getInt("base_h", screenH)
-canvasView.screenW = screenW
-canvasView.screenH = screenH
-canvasView.addLine(RulerLine(true, defaultCenterY, colorH))
-canvasView.addLine(RulerLine(false, defaultCenterX, colorV))
-canvasView.selectedLine = canvasView.getAllLines().firstOrNull()
-canvasView.invalidate()
-}
-private fun setupCanvas() {
-canvasView = RulerCanvasView(this) {
-if (isLoupeActive) refreshLoupeDisplay()
-}
-val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-canvasParams = WindowManager.LayoutParams(
-screenW,
-screenH,
-type,
-WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-PixelFormat.TRANSLUCENT
-).apply {
-gravity = Gravity.TOP or Gravity.START
-x = 0
-y = 0
-if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-}
-}
-wm.addView(canvasView, canvasParams)
-}
-private fun toggleUnderneathTouch(btn: Button) {
-isUnderneathTouchOn = !isUnderneathTouchOn
-if (isUnderneathTouchOn) {
-canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-btn.text = "Tactile: ON"
-btn.background = createRoundedBg(Color.parseColor("#CC16A34A"), 20f)
-} else {
-canvasParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-btn.text = "Tactile: OFF"
-btn.background = createRoundedBg(Color.parseColor("#66475569"), 20f)
-if (isLoupeActive) {
-captureCleanBackground()
-}
-}
-wm.updateViewLayout(canvasView, canvasParams)
-canvasView.showArrows = !isUnderneathTouchOn
-canvasView.invalidate()
-}
-private fun setupLoupe() {
-loupeView = RoundLoupeView(
-context = this,
-onDrag = { dx, dy ->
-loupeParams.x += dx
-loupeParams.y += dy
-wm.updateViewLayout(loupeView, loupeParams)
-refreshLoupeDisplay()
-},
-onRefreshClick = {
-captureCleanBackground()
-}
-)
-val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
-loupeParams = WindowManager.LayoutParams(
-420, 420, type,
-WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-PixelFormat.TRANSLUCENT
-).apply {
-gravity = Gravity.TOP or Gravity.START
-x = (screenW / 2) - 210
-y = (screenH / 2) - 210
-}
-loupeView.visibility = View.GONE
-wm.addView(loupeView, loupeParams)
-}
-private fun refreshLoupeDisplay() {
-if (!isLoupeActive) return
-val allLines = canvasView.getAllLines()
-val centerX = (loupeParams.x + 210).toFloat()
-val centerY = (loupeParams.y + 210).toFloat()
-val baseW = prefs.getInt("base_w", screenW)
-val baseH = prefs.getInt("base_h", screenH)
-val scaledX = (centerX * baseW / screenW.toFloat()).toInt()
-val scaledY = (centerY * baseH / screenH.toFloat()).toInt()
-loupeView.updateData(screenBitmap, centerX, centerY, scaledX, scaledY, allLines)
-}
-private fun setupSidePanel() {
-panelLayout = LinearLayout(this).apply {
-orientation = LinearLayout.VERTICAL
-background = createRoundedBg(Color.parseColor("#E6111827"), 32f, Color.parseColor("#44FFFFFF"))
-setPadding(16, 16, 16, 16)
-elevation = 12f
-}
-val collapseBtn = Button(this).apply {
-text = "Masquer ▸"
-textSize = 11f
-isAllCaps = false
-setTypeface(null, Typeface.BOLD)
-setTextColor(Color.parseColor("#CBD5E1"))
-background = createRoundedBg(Color.parseColor("#33FFFFFF"), 18f)
-setPadding(8, 0, 8, 0)
-gravity = Gravity.CENTER
-layoutParams = LinearLayout.LayoutParams(235, 72).apply { setMargins(0, 0, 0, 8) }
-setOnClickListener { toggleSidebarCollapse() }
-}
-collapseBtnRef = collapseBtn
-panelLayout.addView(collapseBtn)
-buttonsContainer = LinearLayout(this).apply {
-orientation = LinearLayout.VERTICAL
-}
-panelLayout.addView(buttonsContainer)
-lateinit var touchBtn: Button
-val buttons = listOf(
-"Off" to { cleanupAndStop() },
-"Tactile: OFF" to { toggleUnderneathTouch(touchBtn) },
-"+ H" to {
-val c = prefs.getInt("color_h", Color.RED)
-val y = (screenH * 0.35f) + (canvasView.lineCount() * 40f)
-val newLine = RulerLine(true, y.coerceAtMost(screenH - 120f), c)
-canvasView.addLine(newLine)
-canvasView.selectedLine = newLine
-canvasView.invalidate()
-if (isLoupeActive) refreshLoupeDisplay()
-},
-"+ V" to {
-val c = prefs.getInt("color_v", Color.CYAN)
-val x = (screenW * 0.35f) + (canvasView.lineCount() * 40f)
-val newLine = RulerLine(false, x.coerceAtMost(screenW - 120f), c)
-canvasView.addLine(newLine)
-canvasView.selectedLine = newLine
-canvasView.invalidate()
-if (isLoupeActive) refreshLoupeDisplay()
-},
-"-" to {
-canvasView.removeSelectedOrLast()
-canvasView.invalidate()
-if (isLoupeActive) refreshLoupeDisplay()
-},
-"Loupe" to {
-if (mediaProjection == null) {
-val permIntent = Intent(this, LoupePermissionActivity::class.java).apply {
-addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-}
-startActivity(permIntent)
-} else {
-isLoupeActive = !isLoupeActive
-if (isLoupeActive) {
-loupeBtnRef?.background = createRoundedBg(Color.parseColor("#CC0284C7"), 20f)
-captureCleanBackground()
-} else {
-loupeView.visibility = View.GONE
-loupeBtnRef?.background = createRoundedBg(Color.parseColor("#33FFFFFF"), 20f)
-}
-}
-},
-"Other side" to {
-isPanelRight = !isPanelRight
-panelParams.gravity = (if (isPanelRight) Gravity.END else Gravity.START) or Gravity.CENTER_VERTICAL
-updateCollapseButtonLabel()
-wm.updateViewLayout(panelLayout, panelParams)
-},
-"Paramètres" to { openSettingsDialog() }
-)
-buttons.forEach { (label, action) ->
-val btn = Button(this).apply {
-text = label
-textSize = 12f
-isAllCaps = false
-setTypeface(null, Typeface.BOLD)
-setTextColor(Color.WHITE)
-setPadding(10, 0, 10, 0)
-gravity = Gravity.CENTER
-background = when (label) {
-"Off" -> createRoundedBg(Color.parseColor("#CCDC2626"), 20f)
-"Tactile: OFF" -> createRoundedBg(Color.parseColor("#66475569"), 20f)
-else -> createRoundedBg(Color.parseColor("#33FFFFFF"), 20f)
-}
-val lp = LinearLayout.LayoutParams(235, 84).apply { setMargins(0, 6, 0, 6) }
-layoutParams = lp
-setOnClickListener { action() }
-}
-if (label == "Loupe") loupeBtnRef = btn
-if (label == "Tactile: OFF") touchBtn = btn
-buttonsContainer.addView(btn)
-}
-val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+        buttonsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        panelLayout.addView(buttonsContainer)
+
+        lateinit var touchBtn: Button
+
+        val buttons = listOf(
+            "Off" to { cleanupAndStop() },
+            "Tactile: OFF" to { toggleUnderneathTouch(touchBtn) },
+            "+ H" to {
+                val c = prefs.getInt("color_h", Color.RED)
+                val y = (screenH * 0.35f) + (canvasView.lineCount() * 40f)
+                val newLine = RulerLine(true, y.coerceAtMost(screenH - 120f), c)
+                canvasView.addLine(newLine)
+                canvasView.selectedLine = newLine
+                canvasView.invalidate()
+            },
+            "+ V" to {
+                val c = prefs.getInt("color_v", Color.CYAN)
+                val x = (screenW * 0.35f) + (canvasView.lineCount() * 40f)
+                val newLine = RulerLine(false, x.coerceAtMost(screenW - 120f), c)
+                canvasView.addLine(newLine)
+                canvasView.selectedLine = newLine
+                canvasView.invalidate()
+            },
+            "-" to {
+                canvasView.removeSelectedOrLast()
+                canvasView.invalidate()
+            },
+            "Other side" to {
+                isPanelRight = !isPanelRight
+                panelParams.gravity = (if (isPanelRight) Gravity.END else Gravity.START) or Gravity.CENTER_VERTICAL
+                updateCollapseButtonLabel()
+                wm.updateViewLayout(panelLayout, panelParams)
+            },
+            "Paramètres" to { openSettingsDialog() }
+        )
+
+        buttons.forEach { (label, action) ->
+            val btn = Button(this).apply {
+                text = label
+                textSize = 12f
+                isAllCaps = false
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.WHITE)
+                setPadding(10, 0, 10, 0)
+                gravity = Gravity.CENTER
+                background = when (label) {
+                    "Off" -> createRoundedBg(Color.parseColor("#CCDC2626"), 20f)
+                    "Tactile: OFF" -> createRoundedBg(Color.parseColor("#66475569"), 20f)
+                    else -> createRoundedBg(Color.parseColor("#33FFFFFF"), 20f)
+                }
+                val lp = LinearLayout.LayoutParams(235, 84).apply { setMargins(0, 6, 0, 6) }
+                layoutParams = lp
+                setOnClickListener { action() }
+            }
+            if (label == "Tactile: OFF") touchBtn = btn
+            buttonsContainer.addView(btn)
+        }
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
 panelParams = WindowManager.LayoutParams(
 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -591,7 +352,6 @@ for (line in canvasView.getAllLines()) {
 line.color = if (line.isHorizontal) chosenH else chosenV
 }
 canvasView.invalidate()
-if (isLoupeActive) refreshLoupeDisplay()
 Toast.makeText(this, "Paramètres sauvegardés ($newW×$newH)", Toast.LENGTH_SHORT).show()
 }
 .setNegativeButton("Annuler", null)
@@ -602,21 +362,11 @@ dialog.window?.setType(type)
 dialog.show()
 }
 private fun cleanupAndStop() {
-try {
-virtualDisplay?.release()
-virtualDisplay = null
-imageReader?.close()
-imageReader = null
-mediaProjection?.stop()
-mediaProjection = null
-} catch (e: Exception) {}
 if (viewsAdded) {
 try { wm.removeViewImmediate(canvasView) } catch (e: Exception) {}
 try { wm.removeViewImmediate(panelLayout) } catch (e: Exception) {}
-try { wm.removeViewImmediate(loupeView) } catch (e: Exception) {}
 viewsAdded = false
 }
-try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e: Exception) {}
 stopSelf()
 }
 override fun onDestroy() {
@@ -624,192 +374,7 @@ cleanupAndStop()
 super.onDestroy()
 }
 }
-class RoundLoupeView(
-context: Context,
-val onDrag: (Int, Int) -> Unit,
-val onRefreshClick: () -> Unit
-) : View(context) {
-private var sourceBitmap: Bitmap? = null
-private var focusX = 0f
-private var focusY = 0f
-private var displayX = 0
-private var displayY = 0
-private var lines: Array = emptyArray()
-private val zoomFactor = 20f
-private val radius = 140f
-private val cx = 210f
-private val cy = 210f
-private val orbitRadius = 168f
-private var handleAngle = Math.toRadians(45.0).toFloat()
-private val handleRadius = 34f
-private var dragMode = 0
-private var lastRawX = 0f
-private var lastRawY = 0f
-private val clipPath = Path().apply {
-addCircle(cx, cy, radius, Path.Direction.CW)
-}
-private val borderPaint = Paint().apply {
-color = Color.WHITE
-style = Paint.Style.STROKE
-strokeWidth = 5f
-isAntiAlias = true
-}
-private val bgPaint = Paint().apply {
-color = Color.parseColor("#EE111111")
-isAntiAlias = true
-}
-private val pixelPaint = Paint().apply {
-isFilterBitmap = false
-isAntiAlias = false
-}
-private val linePaint = Paint().apply { strokeWidth = 2f }
-private val crossPaint = Paint().apply {
-color = Color.parseColor("#88FFFFFF")
-strokeWidth = 1f
-}
-private val handlePaint = Paint().apply {
-color = Color.parseColor("#EE0284C7")
-style = Paint.Style.FILL
-isAntiAlias = true
-}
-private val refreshPaint = Paint().apply {
-color = Color.parseColor("#EE16A34A")
-style = Paint.Style.FILL
-isAntiAlias = true
-}
-private val handleIconPaint = Paint().apply {
-color = Color.WHITE
-textSize = 28f
-textAlign = Paint.Align.CENTER
-isFakeBoldText = true
-isAntiAlias = true
-}
-private val pillPaint = Paint().apply {
-color = Color.parseColor("#CC000000")
-isAntiAlias = true
-}
-private val textPaint = Paint().apply {
-color = Color.WHITE
-textSize = 20f
-textAlign = Paint.Align.CENTER
-isFakeBoldText = true
-isAntiAlias = true
-}
-fun updateData(bmp: Bitmap?, fx: Float, fy: Float, dispX: Int, dispY: Int, allLines: Array) {
-sourceBitmap = bmp
-focusX = fx
-focusY = fy
-displayX = dispX
-displayY = dispY
-lines = allLines
-invalidate()
-}
-override fun onDraw(canvas: Canvas) {
-super.onDraw(canvas)
-canvas.save()
-canvas.clipPath(clipPath)
-canvas.drawCircle(cx, cy, radius, bgPaint)
-sourceBitmap?.let { bmp ->
-if (!bmp.isRecycled) {
-val diameter = radius * 2f
-val halfSpan = (diameter / zoomFactor) / 2f
-val srcLeft = (focusX - halfSpan).toInt().coerceIn(0, bmp.width - 1)
-val srcTop = (focusY - halfSpan).toInt().coerceIn(0, bmp.height - 1)
-val srcRight = (focusX + halfSpan).toInt().coerceIn(srcLeft + 1, bmp.width)
-val srcBottom = (focusY + halfSpan).toInt().coerceIn(srcTop + 1, bmp.height)
-val srcRect = Rect(srcLeft, srcTop, srcRight, srcBottom)
-val dstRect = Rect((cx - radius).toInt(), (cy - radius).toInt(), (cx + radius).toInt(), (cy + radius).toInt())
-canvas.drawBitmap(bmp, srcRect, dstRect, pixelPaint)
-}
-}
-for (line in lines) {
-linePaint.color = line.color
-if (line.isHorizontal) {
-val dy = (line.pos - focusY) * zoomFactor + cy
-if (dy in (cy - radius)..(cy + radius)) canvas.drawLine(cx - radius, dy, cx + radius, dy, linePaint)
-} else {
-val dx = (line.pos - focusX) * zoomFactor + cx
-if (dx in (cx - radius)..(cx + radius)) canvas.drawLine(dx, cy - radius, dx, cy + radius, linePaint)
-}
-}
-canvas.drawLine(cx - 20f, cy, cx + 20f, cy, crossPaint)
-canvas.drawLine(cx, cy - 20f, cx, cy + 20f, crossPaint)
-canvas.drawRect(cx - 105f, cy + radius - 46f, cx + 105f, cy + radius, pillPaint)
-canvas.drawText("X:$displayX Y:$displayY", cx, cy + radius - 22f, textPaint)
-canvas.restore()
-canvas.drawCircle(cx, cy, radius - 2f, borderPaint)
-// Point orbital de déplacement autour de la loupe
-val hx = cx + orbitRadius * cos(handleAngle)
-val hy = cy + orbitRadius * sin(handleAngle)
-canvas.drawCircle(hx, hy, handleRadius, handlePaint)
-canvas.drawCircle(hx, hy, handleRadius - 2f, borderPaint)
-canvas.drawText("✥", hx, hy + 10f, handleIconPaint)
-// Petit bouton rafraîchir (↻) à l'opposé sur l'orbite
-val rx = cx - orbitRadius * cos(handleAngle)
-val ry = cy - orbitRadius * sin(handleAngle)
-canvas.drawCircle(rx, ry, 28f, refreshPaint)
-canvas.drawCircle(rx, ry, 26f, borderPaint)
-canvas.drawText("↻", rx, ry + 10f, handleIconPaint)
-}
-override fun onTouchEvent(event: MotionEvent): Boolean {
-val x = event.x
-val y = event.y
-val hx = cx + orbitRadius * cos(handleAngle)
-val hy = cy + orbitRadius * sin(handleAngle)
-val rx = cx - orbitRadius * cos(handleAngle)
-val ry = cy - orbitRadius * sin(handleAngle)
-when (event.action) {
-MotionEvent.ACTION_DOWN -> {
-if (hypot(x - rx, y - ry) <= 38f) {
-onRefreshClick()
-return true
-}
-val distHandle = hypot(x - hx, y - hy)
-val distCircle = hypot(x - cx, y - cy)
-if (distHandle <= handleRadius + 22f) {
-dragMode = 1
-lastRawX = event.rawX
-lastRawY = event.rawY
-return true
-} else if (distCircle <= radius) {
-dragMode = 2
-lastRawX = event.rawX
-lastRawY = event.rawY
-return true
-}
-return false
-}
-MotionEvent.ACTION_MOVE -> {
-if (dragMode == 1) {
-val dx = (event.rawX - lastRawX).toInt()
-val dy = (event.rawY - lastRawY).toInt()
-lastRawX = event.rawX
-lastRawY = event.rawY
-onDrag(dx, dy)
-return true
-} else if (dragMode == 2) {
-val dCenter = hypot(x - cx, y - cy)
-if (dCenter > radius * 0.55f) {
-handleAngle = atan2(y - cy, x - cx)
-invalidate()
-} else {
-val dx = (event.rawX - lastRawX).toInt()
-val dy = (event.rawY - lastRawY).toInt()
-lastRawX = event.rawX
-lastRawY = event.rawY
-onDrag(dx, dy)
-}
-return true
-}
-}
-MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-dragMode = 0
-}
-}
-return false
-}
-}
-class RulerCanvasView(context: Context, val onUpdate: () -> Unit) : View(context) {
+class RulerCanvasView(context: Context) : View(context) {
 private val lines = ArrayList()
 var selectedLine: RulerLine? = null
 var showArrows = true
@@ -920,11 +485,11 @@ val yUp = (line.pos - 75f).coerceAtLeast(50f)
 val yDown = (line.pos + 75f).coerceAtMost(height - 50f)
 if (abs(x - cx) < 55f && abs(y - yUp) < 55f) {
 line.pos = (line.pos - 1f).coerceAtLeast(0f)
-invalidate(); onUpdate(); return true
+invalidate(); return true
 }
 if (abs(x - cx) < 55f && abs(y - yDown) < 55f) {
 line.pos = (line.pos + 1f).coerceAtMost(height.toFloat())
-invalidate(); onUpdate(); return true
+invalidate(); return true
 }
 } else {
 val cy = height / 2f
@@ -932,11 +497,11 @@ val xLeft = (line.pos - 75f).coerceAtLeast(50f)
 val xRight = (line.pos + 75f).coerceAtMost(width - 50f)
 if (abs(x - xLeft) < 55f && abs(y - cy) < 55f) {
 line.pos = (line.pos - 1f).coerceAtLeast(0f)
-invalidate(); onUpdate(); return true
+invalidate(); return true
 }
 if (abs(x - xRight) < 55f && abs(y - cy) < 55f) {
 line.pos = (line.pos + 1f).coerceAtMost(width.toFloat())
-invalidate(); onUpdate(); return true
+invalidate(); return true
 }
 }
 }
@@ -953,7 +518,6 @@ if (hit != null && minDist < 70f) {
 selectedLine = hit
 isDragging = true
 invalidate()
-onUpdate()
 return true
 } else {
 selectedLine = null
@@ -965,7 +529,6 @@ if (event.action == MotionEvent.ACTION_MOVE && isDragging) {
 selectedLine?.let {
 it.pos = if (it.isHorizontal) y.coerceIn(0f, height.toFloat()) else x.coerceIn(0f, width.toFloat())
 invalidate()
-onUpdate()
 }
 return true
 }
@@ -975,3 +538,125 @@ isDragging = false
 return false
 }
 }
+
+---
+
+### Fichier 2 : `.github/workflows/build.yml` (Allégé sans permissions inutiles)
+Ouvrez **`.github/workflows/build.yml`**, remplacez son contenu par celui-ci (qui retire les permissions `FOREGROUND_SERVICE_MEDIA_PROJECTION` désormais inutiles) et cliquez sur **Commit changes...** :
+
+```yaml
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Generate Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/pixel/ruler
+          cp MainActivity.kt app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/ArrayList()/ArrayList<RulerLine>()/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+          sed -i 's/getAllLines(): Array/getAllLines(): Array<RulerLine>/g' app/src/main/java/com/pixel/ruler/MainActivity.kt
+
+          cat << 'EOF' > settings.gradle
+          rootProject.name = "PixelRuler"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          buildscript {
+              ext.kotlin_version = '1.9.22'
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.2.2'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          apply plugin: 'com.android.application'
+          apply plugin: 'kotlin-android'
+
+          android {
+              namespace 'com.pixel.ruler'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.pixel.ruler"
+                  minSdk 23
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.22"
+          }
+          EOF
+
+          NS="http://schemas.android"
+          NS="${NS}.com/apk/res/android"
+          cat << EOF > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="${NS}">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <application
+                  android:label="PixelRuler"
+                  android:theme="@android:style/Theme.Translucent.NoTitleBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+
+      - name: Build APK with Gradle
+        run: |
+          gradle wrapper --gradle-version 8.5
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelRuler-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
